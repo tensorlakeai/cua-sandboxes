@@ -1,0 +1,15 @@
+{
+  "name": "vnc-cua",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "pnpm@10.18.0",
+  "scripts": {
+    "dev": "corepack pnpm --filter @vnc-cua/contracts build && concurrently -n contracts,server,web -c yellow,cyan,magenta \"corepack pnpm --filter @vnc-cua/contracts dev\" \"corepack pnpm --filter @vnc-cua/server dev\" \"corepack pnpm --filter @vnc-cua/web dev\"",
+    "build": "corepack pnpm -r build",
+    "test": "corepack pnpm --filter @vnc-cua/contracts build && corepack pnpm -r test",
+    "typecheck": "corepack pnpm --filter @vnc-cua/contracts build && corepack pnpm -r typecheck"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
