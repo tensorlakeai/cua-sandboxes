@@ -11,14 +11,15 @@ import {
   useEffectEvent,
   useMemo,
   useState,
+  type KeyboardEvent,
 } from "react";
 
 import {
   closeSession,
   createSession,
+  deleteArchivedSession,
   listMessages,
   listSessions,
-  refreshSession,
   sendMessage,
   stopSession,
 } from "./api.js";
@@ -27,12 +28,14 @@ type MessageMap = Record<string, ChatMessage[]>;
 
 const EVENT_TYPES = [
   "session.upsert",
+  "session.deleted",
   "session.terminated",
   "message.created",
   "screenshot.updated",
   "run.state",
   "error",
 ] as const;
+const LIVE_CONNECTION_MESSAGE = "Lost the live connection. Waiting to reconnect...";
 
 export default function App() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
@@ -62,7 +65,7 @@ export default function App() {
     null;
   const activeTabValue = activeSessions.some((session) => session.id === selectedSessionId)
     ? selectedSessionId ?? ""
-    : (activeSessions[0]?.id ?? "");
+    : "";
 
   useEffect(() => {
     if (!selectedSession && sessions.length === 0) {
@@ -126,6 +129,13 @@ export default function App() {
             setSelectedSessionId(data.session.id);
           }
           break;
+        case "session.deleted":
+          setSessions((current) => removeSession(current, data.sessionId));
+          setMessagesBySession((current) => removeMessagesForSession(current, data.sessionId));
+          setSelectedSessionId((current) =>
+            current === data.sessionId ? null : current,
+          );
+          break;
         case "session.terminated":
           setStatusMessage("Sandbox terminated.");
           break;
@@ -167,6 +177,20 @@ export default function App() {
     });
   });
 
+  const handleStreamOpen = useEffectEvent(() => {
+    setStatusMessage((current) =>
+      current === LIVE_CONNECTION_MESSAGE ? null : current,
+    );
+  });
+
+  const handleStreamError = useEffectEvent(() => {
+    if (selectedSession?.terminatedAt !== null) {
+      return;
+    }
+
+    setStatusMessage(LIVE_CONNECTION_MESSAGE);
+  });
+
   useEffect(() => {
     const source = new EventSource("/api/events");
 
@@ -174,14 +198,13 @@ export default function App() {
       source.addEventListener(eventType, handleEvent as EventListener);
     }
 
-    source.onerror = () => {
-      setStatusMessage("Lost the live connection. Waiting to reconnect...");
-    };
+    source.onopen = handleStreamOpen;
+    source.onerror = handleStreamError;
 
     return () => {
       source.close();
     };
-  }, [handleEvent]);
+  }, [handleEvent, handleStreamError, handleStreamOpen]);
 
   async function loadInitialState() {
     try {
@@ -222,20 +245,6 @@ export default function App() {
     }
   }
 
-  async function handleRefreshSession() {
-    if (!selectedSession || selectedSession.terminatedAt) {
-      return;
-    }
-
-    try {
-      const response = await refreshSession(selectedSession.id);
-      setSessions((current) => upsertSession(current, response.session));
-      setStatusMessage(null);
-    } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : "Failed to refresh screenshot");
-    }
-  }
-
   async function handleStopSession() {
     if (!selectedSession) {
       return;
@@ -265,6 +274,30 @@ export default function App() {
     }
   }
 
+  async function handleDeleteArchivedSession(sessionId: string) {
+    try {
+      await deleteArchivedSession(sessionId);
+      setSessions((current) => removeSession(current, sessionId));
+      setMessagesBySession((current) => removeMessagesForSession(current, sessionId));
+      if (selectedSessionId === sessionId) {
+        const nextArchived = archivedSessions.find((session) => session.id !== sessionId);
+        setSelectedSessionId(nextArchived?.id ?? activeSessions[0]?.id ?? null);
+      }
+      setStatusMessage(null);
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : "Failed to delete archived session");
+    }
+  }
+
+  function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key !== "Enter" || event.shiftKey) {
+      return;
+    }
+
+    event.preventDefault();
+    void handleSubmitMessage();
+  }
+
   const screenshotUrl = selectedSession
     && selectedSession.lastScreenshotRevision > 0
     ? `/api/sessions/${selectedSession.id}/screenshot?rev=${selectedSession.lastScreenshotRevision}`
@@ -272,6 +305,7 @@ export default function App() {
   const selectedMessages = selectedSession
     ? (messagesBySession[selectedSession.id] ?? [])
     : [];
+  const isArchivedSelection = selectedSession?.terminatedAt !== null;
   const composerDisabled =
     !selectedSession ||
     selectedSession.terminatedAt !== null ||
@@ -279,32 +313,32 @@ export default function App() {
     selectedSession.runState === "running" ||
     selectedSession.runState === "stopping";
 
+  useEffect(() => {
+    if (isArchivedSelection) {
+      setStatusMessage((current) =>
+        current === LIVE_CONNECTION_MESSAGE ? null : current,
+      );
+    }
+  }, [isArchivedSelection]);
+
   return (
     <div className="min-h-screen px-4 py-4 text-stone-100 md:px-6">
       <div className="mx-auto flex min-h-[calc(100vh-2rem)] max-w-[1600px] flex-col rounded-[32px] border border-white/10 bg-stone-950/75 shadow-[0_24px_90px_rgba(0,0,0,0.45)] backdrop-blur">
         <header className="border-b border-white/10 px-5 py-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
-              <p className="text-xs uppercase tracking-[0.28em] text-amber-300/70">
-                Tensorlake + OpenAI
-              </p>
               <h1 className="text-2xl font-semibold tracking-tight text-stone-50">
                 CUA Sandboxes
               </h1>
             </div>
-            <div className="flex items-center gap-3">
-              <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-sm text-stone-300">
-                {activeSessions.length} active
-              </span>
-              <button
-                className="rounded-full bg-amber-300 px-4 py-2 text-sm font-medium text-stone-950 transition hover:bg-amber-200 disabled:cursor-not-allowed disabled:bg-amber-300/60"
-                disabled={isCreating}
-                onClick={() => void handleCreateSession()}
-                type="button"
-              >
-                {isCreating ? "Starting..." : "+ New sandbox"}
-              </button>
-            </div>
+            <button
+              className="rounded-full bg-amber-300 px-4 py-2 text-sm font-medium text-stone-950 transition hover:bg-amber-200 disabled:cursor-not-allowed disabled:bg-amber-300/60"
+              disabled={isCreating}
+              onClick={() => void handleCreateSession()}
+              type="button"
+            >
+              {isCreating ? "Starting..." : "+ New sandbox"}
+            </button>
           </div>
           {statusMessage ? (
             <p className="mt-3 rounded-2xl border border-amber-400/20 bg-amber-400/10 px-3 py-2 text-sm text-amber-100">
@@ -437,6 +471,7 @@ export default function App() {
                     className="min-h-[120px] w-full rounded-[24px] border border-white/10 bg-white/5 px-4 py-4 text-sm text-stone-100 outline-none transition placeholder:text-stone-500 focus:border-amber-300/50 focus:bg-white/8"
                     disabled={composerDisabled}
                     onChange={(event) => setComposer(event.target.value)}
+                    onKeyDown={handleComposerKeyDown}
                     placeholder={
                       selectedSession?.runState === "pending"
                         ? "Wait for the sandbox to finish booting..."
@@ -446,10 +481,7 @@ export default function App() {
                     }
                     value={composer}
                   />
-                  <div className="flex items-center justify-between gap-3">
-                    <p className="text-xs text-stone-500">
-                      One sandbox per tab. Runs stream back live through SSE.
-                    </p>
+                  <div className="flex justify-end">
                     <button
                       className="rounded-full bg-teal-300 px-4 py-2 text-sm font-medium text-stone-950 transition hover:bg-teal-200 disabled:cursor-not-allowed disabled:bg-teal-300/60"
                       disabled={composerDisabled || composer.trim().length === 0}
@@ -477,17 +509,6 @@ export default function App() {
                     : "No screenshot available"}
                 </p>
               </div>
-              {selectedSession &&
-              selectedSession.terminatedAt === null &&
-              selectedSession.runState !== "pending" ? (
-                <button
-                  className="rounded-full border border-white/10 bg-white/5 px-3 py-2 text-sm text-stone-200 transition hover:bg-white/10"
-                  onClick={() => void handleRefreshSession()}
-                  type="button"
-                >
-                  Refresh
-                </button>
-              ) : null}
             </div>
 
             <div className="flex-1 overflow-hidden px-5 py-5">
@@ -529,21 +550,39 @@ export default function App() {
                     </p>
                   ) : (
                     archivedSessions.map((session) => (
-                      <button
-                        className={`flex w-full items-center justify-between rounded-[20px] border px-4 py-3 text-left text-sm transition ${
+                      <div
+                        className={`flex items-center gap-2 rounded-[20px] border px-3 py-2 transition ${
                           session.id === selectedSession?.id
-                            ? "border-amber-300/40 bg-amber-300/10 text-amber-50"
-                            : "border-white/10 bg-white/4 text-stone-300 hover:bg-white/8"
+                            ? "border-amber-300/40 bg-amber-300/10"
+                            : "border-white/10 bg-white/4 hover:bg-white/8"
                         }`}
                         key={session.id}
-                        onClick={() => setSelectedSessionId(session.id)}
-                        type="button"
                       >
-                        <span>{session.title}</span>
-                        <span className="text-xs uppercase tracking-[0.2em] text-stone-500">
-                          archived
-                        </span>
-                      </button>
+                        <button
+                          aria-label={`${session.title} archived`}
+                          className="flex min-w-0 flex-1 items-center justify-between rounded-[16px] px-1 py-1 text-left text-sm text-stone-300"
+                          onClick={() => setSelectedSessionId(session.id)}
+                          type="button"
+                        >
+                          <span className={session.id === selectedSession?.id ? "text-amber-50" : ""}>
+                            {session.title}
+                          </span>
+                          <span className="text-xs uppercase tracking-[0.2em] text-stone-500">
+                            archived
+                          </span>
+                        </button>
+                        <button
+                          aria-label={`Delete ${session.title} permanently`}
+                          className="rounded-full border border-rose-400/20 bg-rose-500/8 px-3 py-2 text-xs font-medium text-rose-100 transition hover:border-rose-400/40 hover:bg-rose-500/16"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void handleDeleteArchivedSession(session.id);
+                          }}
+                          type="button"
+                        >
+                          Delete
+                        </button>
+                      </div>
                     ))
                   )}
                 </ScrollArea.Viewport>
@@ -565,6 +604,15 @@ function upsertSession(
     ? current.map((session) => (session.id === incoming.id ? incoming : session))
     : [incoming, ...current];
   return sortSessions(next);
+}
+
+function removeSession(current: SessionSummary[], sessionId: string): SessionSummary[] {
+  return current.filter((session) => session.id !== sessionId);
+}
+
+function removeMessagesForSession(current: MessageMap, sessionId: string): MessageMap {
+  const { [sessionId]: _removed, ...rest } = current;
+  return rest;
 }
 
 function sortSessions(sessions: SessionSummary[]): SessionSummary[] {

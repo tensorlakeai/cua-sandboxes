@@ -1,9 +1,11 @@
 import {
   createSessionResponseSchema,
+  deleteSessionResponseSchema,
   listMessagesResponseSchema,
   listSessionsResponseSchema,
   postMessageRequestSchema,
   sessionMutationResponseSchema,
+  type DeleteSessionResponse,
   type ListMessagesResponse,
   type ListSessionsResponse,
   type SessionMutationResponse,
@@ -88,5 +90,13 @@ export function closeSession(sessionId: string): Promise<SessionMutationResponse
     `/api/sessions/${sessionId}`,
     { method: "DELETE" },
     (value) => sessionMutationResponseSchema.parse(value),
+  );
+}
+
+export function deleteArchivedSession(sessionId: string): Promise<DeleteSessionResponse> {
+  return requestJson(
+    `/api/sessions/${sessionId}/permanent`,
+    { method: "DELETE" },
+    (value) => deleteSessionResponseSchema.parse(value),
   );
 }

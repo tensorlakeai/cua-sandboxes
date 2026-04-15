@@ -25,6 +25,7 @@ import App from "./App.js";
 class MockEventSource {
   static instances: MockEventSource[] = [];
 
+  onopen: ((this: EventSource, ev: Event) => unknown) | null = null;
   onerror: ((this: EventSource, ev: Event) => unknown) | null = null;
   readonly close = vi.fn();
   private readonly listeners = new Map<string, Set<EventListener>>();
@@ -41,6 +42,14 @@ class MockEventSource {
 
   removeEventListener(type: string, listener: EventListener): void {
     this.listeners.get(type)?.delete(listener);
+  }
+
+  open(): void {
+    this.onopen?.call(this as unknown as EventSource, new Event("open"));
+  }
+
+  fail(): void {
+    this.onerror?.call(this as unknown as EventSource, new Event("error"));
   }
 
   emit(event: SseEvent): void {
@@ -143,6 +152,14 @@ function installFetchMock(state: ApiState) {
       return jsonResponse({
         messages: state.messagesBySession[messagesMatch[1] ?? ""] ?? [],
       });
+    }
+
+    const permanentDeleteMatch = url.match(/^\/api\/sessions\/([^/]+)\/permanent$/);
+    if (permanentDeleteMatch && method === "DELETE") {
+      const sessionId = permanentDeleteMatch[1] ?? "";
+      state.sessions = state.sessions.filter((session) => session.id !== sessionId);
+      delete state.messagesBySession[sessionId];
+      return jsonResponse({ sessionId });
     }
 
     const refreshMatch = url.match(/^\/api\/sessions\/([^/]+)\/refresh$/);
@@ -255,7 +272,6 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "+ New sandbox" }));
 
     await screen.findByRole("tab", { name: "Sandbox 2" });
-    expect(screen.getByText("2 active")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Close Sandbox 2" }));
 
@@ -263,8 +279,98 @@ describe("App", () => {
       expect(screen.queryByRole("tab", { name: "Sandbox 2" })).not.toBeInTheDocument();
     });
 
-    expect(screen.getByText("1 active")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Sandbox 2/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Sandbox 2 archived" })).toBeInTheDocument();
+  });
+
+  it("permanently deletes archived sessions from the recent list", async () => {
+    const active = makeSession({
+      id: "session-1",
+      title: "Sandbox 1",
+      updatedAt: "2026-04-13T12:00:30.000Z",
+    });
+    const archived = makeSession({
+      id: "session-2",
+      title: "Old Session",
+      sandboxId: null,
+      sandboxStatus: "terminated",
+      runState: "terminated",
+      terminatedAt: "2026-04-13T11:59:00.000Z",
+      updatedAt: "2026-04-13T12:00:00.000Z",
+    });
+
+    const fetchMock = installFetchMock({
+      sessions: [active, archived],
+      messagesBySession: {
+        [active.id]: [],
+        [archived.id]: [makeMessage({ id: "m2", sessionId: archived.id, content: "Archived summary" })],
+      },
+      createQueue: [],
+    });
+
+    render(<App />);
+
+    await screen.findByRole("tab", { name: "Sandbox 1" });
+    fireEvent.click(screen.getByRole("button", { name: "Old Session archived" }));
+    await screen.findByText("Archived summary");
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete Old Session permanently" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: "Old Session archived" })).not.toBeInTheDocument();
+    });
+    expect(
+      fetchMock.mock.calls.some(
+        ([input, init]) =>
+          input === `/api/sessions/${archived.id}/permanent` &&
+          init?.method === "DELETE",
+      ),
+    ).toBe(true);
+  });
+
+  it("sends on Enter and keeps Shift+Enter available for multiline input", async () => {
+    const sandbox1 = makeSession({
+      id: "session-1",
+      title: "Sandbox 1",
+      updatedAt: "2026-04-13T12:00:10.000Z",
+    });
+
+    const fetchMock = installFetchMock({
+      sessions: [sandbox1],
+      messagesBySession: {
+        [sandbox1.id]: [],
+      },
+      createQueue: [],
+    });
+
+    render(<App />);
+
+    const textarea = await screen.findByRole("textbox");
+
+    fireEvent.change(textarea, { target: { value: "first line" } });
+    fireEvent.keyDown(textarea, {
+      key: "Enter",
+      shiftKey: true,
+    });
+
+    expect(
+      fetchMock.mock.calls.some(
+        ([input, init]) =>
+          input === `/api/sessions/${sandbox1.id}/messages` &&
+          init?.method === "POST",
+      ),
+    ).toBe(false);
+
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(
+          ([input, init]) =>
+            input === `/api/sessions/${sandbox1.id}/messages` &&
+            init?.method === "POST",
+        ),
+      ).toBe(true);
+    });
   });
 
   it("applies SSE updates to the right session and loads archived transcripts", async () => {
@@ -339,13 +445,76 @@ describe("App", () => {
       `/api/sessions/${sandbox2.id}/screenshot?rev=4`,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: /Old Session/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Old Session archived" }));
 
     await screen.findByText("Archived summary");
+    expect(screen.getByRole("heading", { name: "Old Session" })).toBeInTheDocument();
+    for (const tab of screen.getAllByRole("tab")) {
+      expect(tab).toHaveAttribute("aria-selected", "false");
+    }
     expect(
       screen.getByText(
         "This sandbox was terminated. Its transcript and last screenshot remain available below.",
       ),
     ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Refresh" })).not.toBeInTheDocument();
+  });
+
+  it("hides the reconnect banner for archived selections and clears it after reconnect", async () => {
+    const active = makeSession({
+      id: "session-1",
+      title: "Sandbox 1",
+      updatedAt: "2026-04-13T12:00:30.000Z",
+    });
+    const archived = makeSession({
+      id: "session-2",
+      title: "Old Session",
+      sandboxId: null,
+      sandboxStatus: "terminated",
+      runState: "terminated",
+      terminatedAt: "2026-04-13T11:59:00.000Z",
+      updatedAt: "2026-04-13T12:00:00.000Z",
+    });
+
+    installFetchMock({
+      sessions: [active, archived],
+      messagesBySession: {
+        [active.id]: [],
+        [archived.id]: [makeMessage({ id: "m2", sessionId: archived.id, content: "Archived summary" })],
+      },
+      createQueue: [],
+    });
+
+    render(<App />);
+
+    await screen.findByRole("tab", { name: "Sandbox 1" });
+
+    const eventSource = MockEventSource.latest();
+
+    act(() => {
+      eventSource.fail();
+    });
+    expect(
+      screen.getByText("Lost the live connection. Waiting to reconnect..."),
+    ).toBeInTheDocument();
+
+    act(() => {
+      eventSource.open();
+    });
+    await waitFor(() => {
+      expect(
+        screen.queryByText("Lost the live connection. Waiting to reconnect..."),
+      ).not.toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Old Session archived" }));
+    await screen.findByText("Archived summary");
+
+    act(() => {
+      eventSource.fail();
+    });
+    expect(
+      screen.queryByText("Lost the live connection. Waiting to reconnect..."),
+    ).not.toBeInTheDocument();
   });
 });

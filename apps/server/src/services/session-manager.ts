@@ -1,3 +1,4 @@
+import fs from "node:fs/promises";
 import path from "node:path";
 
 import {
@@ -69,10 +70,16 @@ class RunAbortedError extends Error {
   }
 }
 
+const OPENAI_MODEL = "gpt-5.4";
+const UNTITLED_SESSION_TITLE = "New sandbox";
+const MAX_SESSION_TITLE_LENGTH = 48;
 const SYSTEM_PROMPT = `You are a computer-use agent operating a Linux desktop inside a sandbox.
 Use the built-in computer tool for UI work. Be concise and helpful.
 Do not send, submit, post, delete, purchase, or transmit sensitive data or irreversible changes without explicit user confirmation.
 If a task would require risky external side effects, stop and ask the user in normal assistant text instead of taking that step.`;
+const SESSION_TITLE_PROMPT = `Generate a short descriptive title for this computer-use session.
+Return only the title, with no quotes, markdown, or explanation.
+Keep it concise and specific, usually 2 to 5 words.`;
 
 export class SessionManager {
   private readonly runtimes = new Map<string, ActiveRuntime>();
@@ -143,7 +150,7 @@ export class SessionManager {
       const sessionId = `session_${crypto.randomUUID()}`;
       const session = this.options.store.createSession({
         id: sessionId,
-        title: `Sandbox ${this.options.store.listSessionRecords().length + 1}`,
+        title: UNTITLED_SESSION_TITLE,
         sandboxId: sandbox.sandboxId,
         sandboxStatus: "running",
         runState: "pending",
@@ -279,6 +286,37 @@ export class SessionManager {
     return toSessionSummary(terminated);
   }
 
+  async deleteArchivedSession(sessionId: string): Promise<{ sessionId: string }> {
+    const record = this.options.store.requireSessionRecord(sessionId);
+    if (!record.terminatedAt) {
+      throw new Error(`Session ${sessionId} must be archived before it can be deleted`);
+    }
+
+    const runtime = this.runtimes.get(sessionId);
+    if (runtime) {
+      runtime.stopRequested = true;
+      runtime.bootAbortController?.abort();
+      runtime.abortController?.abort();
+      await runtime.bootPromise?.catch(() => {});
+      await runtime.currentRunPromise?.catch(() => {});
+      await runtime.desktop?.close().catch(() => {});
+      runtime.sandbox.close?.();
+      this.runtimes.delete(sessionId);
+    }
+
+    if (record.lastScreenshotPath) {
+      await fs.rm(record.lastScreenshotPath, { force: true }).catch(() => {});
+    }
+
+    this.options.store.deleteSession(sessionId);
+    this.options.eventBus.publish({
+      type: "session.deleted",
+      sessionId,
+    });
+
+    return { sessionId };
+  }
+
   async waitForIdle(sessionId: string): Promise<void> {
     const runtime = this.runtimes.get(sessionId);
     await runtime?.bootPromise;
@@ -310,9 +348,10 @@ export class SessionManager {
       }
 
       let record = this.options.store.requireSessionRecord(sessionId);
+      record = await this.maybeGenerateSessionTitle(record, userContent, runtime);
       let response = await this.options.openai.responses.create(
         {
-          model: "gpt-5.4",
+          model: OPENAI_MODEL,
           tools: [{ type: "computer" }],
           ...(record.openaiLastResponseId
             ? {
@@ -374,7 +413,7 @@ export class SessionManager {
 
         response = await this.options.openai.responses.create(
           {
-            model: "gpt-5.4",
+            model: OPENAI_MODEL,
             tools: [{ type: "computer" }],
             previous_response_id: response.id,
             input: [
@@ -425,6 +464,54 @@ export class SessionManager {
         return;
       }
       await this.handleFailure(sessionId, error);
+    }
+  }
+
+  private async maybeGenerateSessionTitle(
+    record: SessionRecord,
+    userContent: string,
+    runtime: ActiveRuntime,
+  ): Promise<SessionRecord> {
+    if (record.openaiLastResponseId || !isDefaultSessionTitle(record.title)) {
+      return record;
+    }
+
+    try {
+      const response = await this.options.openai.responses.create(
+        {
+          model: OPENAI_MODEL,
+          input: [
+            {
+              role: "system",
+              content: [{ type: "input_text", text: SESSION_TITLE_PROMPT }],
+            },
+            {
+              role: "user",
+              content: [{ type: "input_text", text: userContent }],
+            },
+          ],
+        },
+        runtime.abortController?.signal
+          ? { signal: runtime.abortController.signal }
+          : undefined,
+      );
+
+      const title = sanitizeSessionTitle(extractAssistantText(response));
+      if (!title || title === record.title) {
+        return record;
+      }
+
+      const updated = this.options.store.updateSession(record.id, {
+        title,
+      });
+      this.publishSession(updated);
+      return updated;
+    } catch (error) {
+      if (error instanceof RunAbortedError || isAbortLikeError(error, runtime)) {
+        throw error;
+      }
+
+      return record;
     }
   }
 
@@ -665,6 +752,23 @@ function extractAssistantText(response: OpenAIResponseLike): string {
   }
 
   return texts.join("\n\n");
+}
+
+function sanitizeSessionTitle(raw: string): string | null {
+  const cleaned = raw
+    .replace(/[\r\n]+/g, " ")
+    .replace(/^["'`]+|["'`]+$/g, "")
+    .replace(/[.!?,:;]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, MAX_SESSION_TITLE_LENGTH)
+    .trim();
+
+  return cleaned || null;
+}
+
+function isDefaultSessionTitle(title: string): boolean {
+  return title === UNTITLED_SESSION_TITLE || /^Sandbox \d+$/.test(title);
 }
 
 function findComputerCall(

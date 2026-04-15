@@ -76,6 +76,7 @@ describe("SessionManager", () => {
     const session = await harness.manager.createSession();
     expect(session.runState).toBe("pending");
     expect(session.lastScreenshotRevision).toBe(0);
+    expect(session.title).toBe("New sandbox");
 
     await harness.manager.waitForIdle(session.id);
 
@@ -102,6 +103,7 @@ describe("SessionManager", () => {
     const session = await harness.manager.createSession();
     await harness.manager.waitForIdle(session.id);
 
+    harness.openai.enqueueResponse(assistantResponse("title-1", "Open Window"));
     harness.openai.enqueueResponse(
       computerCallResponse("resp-1", "call-1", [
         { type: "move", x: 140, y: 220 },
@@ -115,7 +117,7 @@ describe("SessionManager", () => {
 
     const messages = harness.store.listMessages(session.id);
     const record = harness.store.requireSessionRecord(session.id);
-    const secondCall = harness.openai.responses.create.mock.calls[1]?.[0] as {
+    const secondCall = harness.openai.responses.create.mock.calls[2]?.[0] as {
       previous_response_id: string;
       input: Array<{
         type: string;
@@ -135,6 +137,7 @@ describe("SessionManager", () => {
       ["user", "text", "Open a window"],
       ["assistant", "text", "Finished opening the window."],
     ]);
+    expect(record.title).toBe("Open Window");
     expect(record.runState).toBe("ready");
     expect(record.openaiLastResponseId).toBe("resp-2");
     expect(record.lastScreenshotRevision).toBe(2);
@@ -169,6 +172,7 @@ describe("SessionManager", () => {
     const session = await harness.manager.createSession();
     await harness.manager.waitForIdle(session.id);
 
+    harness.openai.enqueueResponse(assistantResponse("title-r1", "Move Mouse"));
     harness.openai.enqueueResponse(
       computerCallResponse("resp-r1", "call-r1", [
         { type: "move", x: 30, y: 40 },
@@ -184,6 +188,7 @@ describe("SessionManager", () => {
 
     expect(sandbox.connectDesktop).toHaveBeenCalledTimes(2);
     expect(desktop2.screenshot).toHaveBeenCalledTimes(1);
+    expect(record.title).toBe("Move Mouse");
     expect(record.runState).toBe("ready");
     expect(record.lastScreenshotRevision).toBe(2);
     expect(messages.at(-1)?.content).toBe("Recovered after reconnect.");
@@ -238,14 +243,20 @@ describe("SessionManager", () => {
     const session = await harness.manager.createSession();
     await harness.manager.waitForIdle(session.id);
 
+    harness.openai.enqueueResponse(assistantResponse("title-stop", "Slow Task"));
     harness.openai.enqueueHandler(
       async (_body, options) =>
         await new Promise((_, reject) => {
-          options?.signal?.addEventListener("abort", () => {
+          const abort = () => {
             const error = new Error("The operation was aborted");
             error.name = "AbortError";
             reject(error);
-          });
+          };
+
+          options?.signal?.addEventListener("abort", abort);
+          if (options?.signal?.aborted) {
+            abort();
+          }
         }),
     );
 
@@ -267,6 +278,7 @@ describe("SessionManager", () => {
       ["text", "Do something slow"],
       ["status", "Run stopped."],
     ]);
+    expect(record.title).toBe("Slow Task");
     expect(record.runState).toBe("ready");
   });
 });

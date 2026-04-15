@@ -130,4 +130,53 @@ describe("server routes", () => {
     expect(sandbox.terminate).toHaveBeenCalledTimes(1);
     expect(sandbox.desktop.close).toHaveBeenCalledTimes(1);
   });
+
+  it("permanently deletes archived sessions through the API", async () => {
+    const workspace = await createTempWorkspace("vnc-cua-server-purge-");
+    const sandboxClient = new FakeSandboxClient();
+    const openai = new FakeOpenAI();
+    const sandbox = new FakeSandbox("sbx-api-purge", new FakeDesktop([tinyPngBytes()]));
+    sandboxClient.queueSandbox(sandbox);
+
+    const { app, store, sessionManager } = await createApp({
+      env: createTestEnv(workspace.root),
+      openai,
+      sandboxClient,
+      screenshotDir: workspace.screenshotDir,
+      restoreOnStartup: false,
+      logger: false,
+    });
+
+    cleanups.push(async () => {
+      await app.close();
+      await cleanupWorkspace(workspace.root);
+    });
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/sessions",
+    });
+    const sessionId = (created.json() as { session: { id: string } }).session.id;
+    await sessionManager.waitForIdle(sessionId);
+
+    const archived = await app.inject({
+      method: "DELETE",
+      url: `/api/sessions/${sessionId}`,
+    });
+    const archivedSession = (archived.json() as { session: { lastScreenshotRevision: number } }).session;
+    expect(archivedSession.lastScreenshotRevision).toBe(1);
+
+    const recordBeforeDelete = store.requireSessionRecord(sessionId);
+    const screenshotPath = recordBeforeDelete.lastScreenshotPath ?? "";
+
+    const deleted = await app.inject({
+      method: "DELETE",
+      url: `/api/sessions/${sessionId}/permanent`,
+    });
+
+    expect(deleted.statusCode).toBe(200);
+    expect(deleted.json()).toEqual({ sessionId });
+    expect(store.getSessionRecord(sessionId)).toBeNull();
+    expect(await fs.access(screenshotPath).then(() => true).catch(() => false)).toBe(false);
+  });
 });

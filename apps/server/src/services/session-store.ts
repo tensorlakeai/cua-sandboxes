@@ -124,6 +124,12 @@ export class SessionStore {
     });
   }
 
+  deleteSession(sessionId: string): SessionRecord {
+    const record = this.requireSessionRecord(sessionId);
+    this.db.delete(sessionsTable).where(eq(sessionsTable.id, sessionId)).run();
+    return record;
+  }
+
   createMessage(input: {
     sessionId: string;
     role: MessageRole;

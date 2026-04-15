@@ -53,6 +53,10 @@ export const sessionMutationResponseSchema = z.object({
   session: sessionSummarySchema,
 });
 
+export const deleteSessionResponseSchema = z.object({
+  sessionId: z.string(),
+});
+
 export const eventSessionUpsertSchema = z.object({
   type: z.literal("session.upsert"),
   session: sessionSummarySchema,
@@ -60,6 +64,11 @@ export const eventSessionUpsertSchema = z.object({
 
 export const eventSessionTerminatedSchema = z.object({
   type: z.literal("session.terminated"),
+  sessionId: z.string(),
+});
+
+export const eventSessionDeletedSchema = z.object({
+  type: z.literal("session.deleted"),
   sessionId: z.string(),
 });
 
@@ -90,6 +99,7 @@ export const eventErrorSchema = z.object({
 export const sseEventSchema = z.discriminatedUnion("type", [
   eventSessionUpsertSchema,
   eventSessionTerminatedSchema,
+  eventSessionDeletedSchema,
   eventMessageCreatedSchema,
   eventScreenshotUpdatedSchema,
   eventRunStateSchema,
@@ -108,4 +118,5 @@ export type PostMessageRequest = z.infer<typeof postMessageRequestSchema>;
 export type SessionMutationResponse = z.infer<
   typeof sessionMutationResponseSchema
 >;
+export type DeleteSessionResponse = z.infer<typeof deleteSessionResponseSchema>;
 export type SseEvent = z.infer<typeof sseEventSchema>;

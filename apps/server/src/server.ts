@@ -3,6 +3,7 @@ import path from "node:path";
 
 import {
   createSessionResponseSchema,
+  deleteSessionResponseSchema,
   listMessagesResponseSchema,
   listSessionsResponseSchema,
   postMessageRequestSchema,
@@ -143,6 +144,12 @@ export async function createApp(options: CreateAppOptions = {}): Promise<AppBund
     return sessionMutationResponseSchema.parse({ session });
   });
 
+  app.delete("/api/sessions/:id/permanent", async (request) => {
+    const sessionId = (request.params as { id: string }).id;
+    const deleted = await sessionManager.deleteArchivedSession(sessionId);
+    return deleteSessionResponseSchema.parse(deleted);
+  });
+
   app.setErrorHandler((error, _request, reply) => {
     const message =
       error instanceof Error ? error.message : "Unknown server error";
@@ -153,9 +160,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<AppBund
           ? 409
           : message.includes("still booting")
             ? 409
-          : message.includes("terminated")
-            ? 409
-            : 500;
+            : message.includes("archived") || message.includes("terminated")
+              ? 409
+              : 500;
 
     reply.status(statusCode).send({
       message,
