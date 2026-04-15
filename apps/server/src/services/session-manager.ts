@@ -106,6 +106,7 @@ Keep it concise and specific, usually 2 to 5 words.`;
 
 export class SessionManager {
   private readonly runtimes = new Map<string, ActiveRuntime>();
+  private statusSweepPromise: Promise<void> | null = null;
 
   constructor(private readonly options: {
     store: SessionStore;
@@ -120,50 +121,28 @@ export class SessionManager {
 
   async restoreSessions(): Promise<void> {
     for (const record of this.options.store.listActiveSessionRecords()) {
-      if (!record.sandboxId) {
-        this.markSessionMissing(record.id, "missing");
-        continue;
-      }
-
-      try {
-        const info = await this.options.sandboxClient.get(record.sandboxId);
-        const status = (info.status ?? "unknown").toLowerCase();
-
-        if (status !== "running") {
-          this.markSessionMissing(record.id, status);
-          continue;
-        }
-
-        const sandbox = this.options.sandboxClient.connect(record.sandboxId);
-        const runtime: ActiveRuntime = {
-          sandbox,
-          desktop: null,
-          vncTunnel: null,
-          vncTunnelPromise: null,
-          bootPromise: null,
-          bootAbortController: new AbortController(),
-          currentRunPromise: null,
-          abortController: null,
-          stopRequested: false,
-        };
-        this.runtimes.set(record.id, runtime);
-
-        const pending = this.options.store.updateSession(record.id, {
-          sandboxStatus: status,
-          runState: "pending",
-          terminatedAt: null,
-        });
-        this.publishRunState(record.id, "pending");
-        this.publishSession(pending);
-
-        runtime.bootPromise = this.bootstrapSession(record.id, runtime).finally(() => {
-          runtime.bootPromise = null;
-          runtime.bootAbortController = null;
-        });
-      } catch {
-        this.markSessionMissing(record.id, "missing");
-      }
+      await this.reconcileSessionRecord(record.id, {
+        allowRuntimeRecovery: true,
+      });
     }
+  }
+
+  async reconcileSandboxStatuses(): Promise<void> {
+    if (this.statusSweepPromise) {
+      return this.statusSweepPromise;
+    }
+
+    this.statusSweepPromise = (async () => {
+      for (const record of this.options.store.listActiveSessionRecords()) {
+        await this.reconcileSessionRecord(record.id, {
+          allowRuntimeRecovery: true,
+        });
+      }
+    })().finally(() => {
+      this.statusSweepPromise = null;
+    });
+
+    return this.statusSweepPromise;
   }
 
   async createSession(): Promise<SessionSummary> {
@@ -851,12 +830,6 @@ export class SessionManager {
     );
   }
 
-  private markSessionMissing(sessionId: string, sandboxStatus: string): void {
-    const updated = this.options.store.terminateSession(sessionId, sandboxStatus);
-    this.publishRunState(sessionId, "terminated");
-    this.publishSession(updated);
-  }
-
   private publishSession(record: SessionRecord): void {
     this.options.eventBus.publish({
       type: "session.upsert",
@@ -939,6 +912,130 @@ export class SessionManager {
       await runtime.sandbox.terminate().catch(() => {});
     }
     runtime.sandbox.close?.();
+  }
+
+  private async reconcileSessionRecord(
+    sessionId: string,
+    options: {
+      allowRuntimeRecovery: boolean;
+    },
+  ): Promise<void> {
+    const record = this.options.store.getSessionRecord(sessionId);
+    if (!record || record.terminatedAt) {
+      return;
+    }
+
+    if (!record.sandboxId) {
+      await this.archiveSession(sessionId, "missing");
+      return;
+    }
+
+    let status: string;
+    try {
+      const info = await this.options.sandboxClient.get(record.sandboxId);
+      status = (info.status ?? record.sandboxStatus ?? "unknown").toLowerCase();
+    } catch (error) {
+      if (isRetryableSandboxStatusCheckError(error)) {
+        return;
+      }
+
+      await this.archiveSession(sessionId, sandboxStatusFromCheckError(error));
+      return;
+    }
+
+    if (status !== "running") {
+      await this.archiveSession(sessionId, status);
+      return;
+    }
+
+    if (record.sandboxStatus !== status) {
+      const updated = this.options.store.updateSession(sessionId, {
+        sandboxStatus: status,
+      });
+      this.publishSession(updated);
+    }
+
+    if (!options.allowRuntimeRecovery) {
+      return;
+    }
+
+    const runtime = this.runtimes.get(sessionId);
+    const canReuseRuntime =
+      runtime &&
+      (runtime.desktop !== null || runtime.bootPromise !== null || runtime.currentRunPromise !== null);
+
+    if (canReuseRuntime) {
+      return;
+    }
+
+    if (runtime) {
+      await this.disposeRuntime(runtime, { terminateSandbox: false });
+      this.runtimes.delete(sessionId);
+    }
+
+    await this.restoreRuntime(this.options.store.requireSessionRecord(sessionId), status);
+  }
+
+  private async restoreRuntime(
+    record: SessionRecord,
+    sandboxStatus: string,
+  ): Promise<void> {
+    if (!record.sandboxId || this.runtimes.has(record.id)) {
+      return;
+    }
+
+    const sandbox = this.options.sandboxClient.connect(record.sandboxId);
+    const runtime: ActiveRuntime = {
+      sandbox,
+      desktop: null,
+      vncTunnel: null,
+      vncTunnelPromise: null,
+      bootPromise: null,
+      bootAbortController: new AbortController(),
+      currentRunPromise: null,
+      abortController: null,
+      stopRequested: false,
+    };
+    this.runtimes.set(record.id, runtime);
+
+    const pending = this.options.store.updateSession(record.id, {
+      sandboxStatus,
+      runState: "pending",
+      terminatedAt: null,
+    });
+    this.publishRunState(record.id, "pending");
+    this.publishSession(pending);
+
+    runtime.bootPromise = this.bootstrapSession(record.id, runtime).finally(() => {
+      runtime.bootPromise = null;
+      runtime.bootAbortController = null;
+    });
+  }
+
+  private async archiveSession(
+    sessionId: string,
+    sandboxStatus: string,
+  ): Promise<void> {
+    const record = this.options.store.getSessionRecord(sessionId);
+    if (!record || record.terminatedAt) {
+      return;
+    }
+
+    const terminated = this.options.store.terminateSession(sessionId, sandboxStatus);
+    this.publishRunState(sessionId, "terminated");
+    this.publishSession(terminated);
+    this.options.eventBus.publish({
+      type: "session.terminated",
+      sessionId,
+    });
+
+    const runtime = this.runtimes.get(sessionId);
+    if (!runtime) {
+      return;
+    }
+
+    await this.disposeRuntime(runtime, { terminateSandbox: false });
+    this.runtimes.delete(sessionId);
   }
 
   private publishAssistantText(sessionId: string, content: string): void {
@@ -1104,6 +1201,40 @@ function isRetryableDesktopConnectError(error: unknown): boolean {
     message.includes("bad gateway") ||
     message.includes("websocket handshake failed")
   );
+}
+
+function isRetryableSandboxStatusCheckError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const message = error.message.toLowerCase();
+  return (
+    message.includes("timed out") ||
+    message.includes("timeout") ||
+    message.includes("etimedout") ||
+    message.includes("econnreset") ||
+    message.includes("network") ||
+    message.includes("fetch failed") ||
+    message.includes("502") ||
+    message.includes("bad gateway")
+  );
+}
+
+function sandboxStatusFromCheckError(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return "missing";
+  }
+
+  const message = error.message.toLowerCase();
+  if (message.includes("terminated")) {
+    return "terminated";
+  }
+  if (message.includes("not found") || message.includes("missing")) {
+    return "missing";
+  }
+
+  return "missing";
 }
 
 function isRecoverableDesktopRuntimeError(error: unknown): boolean {

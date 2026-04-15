@@ -25,6 +25,7 @@ import App from "./App.js";
 const { mockRemoteDesktopCalls } = vi.hoisted(() => ({
   mockRemoteDesktopCalls: [] as Array<{
     className: string | undefined;
+    displayPriority: number | undefined;
     interactiveEnabled: boolean;
     session: SessionSummary | null;
     streamEnabled: boolean;
@@ -34,17 +35,20 @@ const { mockRemoteDesktopCalls } = vi.hoisted(() => ({
 vi.mock("./RemoteDesktop.js", () => ({
   RemoteDesktop: ({
     className,
+    displayPriority,
     interactiveEnabled,
     session,
     streamEnabled,
   }: {
     className?: string;
+    displayPriority?: number;
     interactiveEnabled: boolean;
     session: SessionSummary | null;
     streamEnabled: boolean;
   }) => {
     mockRemoteDesktopCalls.push({
       className,
+      displayPriority,
       interactiveEnabled,
       session,
       streamEnabled,

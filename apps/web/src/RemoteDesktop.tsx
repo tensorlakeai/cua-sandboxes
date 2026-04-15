@@ -1,16 +1,14 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import type { SessionSummary } from "@vnc-cua/contracts";
 
-import { RFB } from "./lib/novnc.js";
-
-const RECONNECT_DELAY_MS = 750;
-const VNC_PASSWORD = "tensorlake";
+import { acquireLiveDesktopHandle, type LiveDesktopHandle } from "./live-desktop-manager.js";
 
 interface RemoteDesktopProps {
   session: SessionSummary | null;
   streamEnabled: boolean;
   interactiveEnabled: boolean;
   className?: string;
+  displayPriority?: number;
 }
 
 export function RemoteDesktop({
@@ -18,11 +16,11 @@ export function RemoteDesktop({
   streamEnabled,
   interactiveEnabled,
   className,
+  displayPriority = 0,
 }: RemoteDesktopProps) {
   const surfaceRef = useRef<HTMLDivElement | null>(null);
-  const rfbRef = useRef<RFB | null>(null);
-  const reconnectTimeoutRef = useRef<number | null>(null);
-  const [connectionGeneration, setConnectionGeneration] = useState(0);
+  const attachmentIdRef = useRef(Symbol("remote-desktop-attachment"));
+  const connectionRef = useRef<LiveDesktopHandle | null>(null);
 
   const canShowLiveDesktop = session != null
     && session.terminatedAt === null
@@ -55,91 +53,45 @@ export function RemoteDesktop({
   }, [session]);
 
   useEffect(() => {
-    if (reconnectTimeoutRef.current !== null) {
-      window.clearTimeout(reconnectTimeoutRef.current);
-      reconnectTimeoutRef.current = null;
-    }
-    setConnectionGeneration(0);
-  }, [session?.id]);
-
-  useEffect(() => () => {
-    if (reconnectTimeoutRef.current !== null) {
-      window.clearTimeout(reconnectTimeoutRef.current);
-      reconnectTimeoutRef.current = null;
-    }
-  }, []);
-
-  useEffect(() => {
     const surface = surfaceRef.current;
+    const attachmentId = attachmentIdRef.current;
+
     if (!surface || !canShowLiveDesktop || !session || !vncUrl) {
-      if (rfbRef.current) {
-        rfbRef.current.disconnect();
-        rfbRef.current = null;
-      }
+      connectionRef.current?.detach(attachmentId);
+      connectionRef.current = null;
       if (surface) {
-        clearSurface(surface);
+        surface.textContent = "";
       }
       return;
     }
 
-    clearSurface(surface);
-
-    const rfb = new RFB(
-      surface,
-      vncUrl,
-      {
-        credentials: { password: VNC_PASSWORD },
-        shared: true,
-      },
-    );
-    rfb.background = "rgb(0, 0, 0)";
-    rfb.clipViewport = false;
-    rfb.compressionLevel = 1;
-    rfb.qualityLevel = 6;
-    rfb.scaleViewport = true;
-    rfb.showDotCursor = true;
-    rfb.viewOnly = !canControl;
-
-    const handleConnect = () => {
-      if (reconnectTimeoutRef.current !== null) {
-        window.clearTimeout(reconnectTimeoutRef.current);
-        reconnectTimeoutRef.current = null;
-      }
-    };
-    const handleDisconnect = () => {
-      if (reconnectTimeoutRef.current !== null) {
-        return;
-      }
-
-      reconnectTimeoutRef.current = window.setTimeout(() => {
-        reconnectTimeoutRef.current = null;
-        setConnectionGeneration((current) => current + 1);
-      }, RECONNECT_DELAY_MS);
-    };
-
-    rfb.addEventListener("connect", handleConnect);
-    rfb.addEventListener("disconnect", handleDisconnect);
-    rfbRef.current = rfb;
+    const handle = acquireLiveDesktopHandle(session.id, vncUrl);
+    connectionRef.current = handle;
 
     return () => {
-      rfb.removeEventListener("connect", handleConnect);
-      rfb.removeEventListener("disconnect", handleDisconnect);
-      if (rfbRef.current === rfb) {
-        rfbRef.current = null;
+      handle.detach(attachmentId);
+      if (connectionRef.current === handle) {
+        connectionRef.current = null;
       }
-      rfb.disconnect();
-      clearSurface(surface);
     };
-  }, [canShowLiveDesktop, connectionGeneration, session?.id, vncUrl]);
+  }, [canShowLiveDesktop, session?.id, vncUrl]);
 
   useEffect(() => {
-    if (rfbRef.current) {
-      rfbRef.current.viewOnly = !canControl;
+    const surface = surfaceRef.current;
+    const handle = connectionRef.current;
+    if (!surface || !handle || !canShowLiveDesktop) {
+      return;
     }
-  }, [canControl]);
+
+    handle.attach(attachmentIdRef.current, {
+      canControl,
+      host: surface,
+      priority: displayPriority,
+    });
+  }, [canControl, canShowLiveDesktop, displayPriority, session?.id]);
 
   function handleMouseDown() {
-    rfbRef.current?.focus();
+    connectionRef.current?.focus();
   }
 
   return (
@@ -175,8 +127,4 @@ export function RemoteDesktop({
       )}
     </div>
   );
-}
-
-function clearSurface(surface: HTMLDivElement): void {
-  surface.textContent = "";
 }

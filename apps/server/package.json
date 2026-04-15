@@ -19,7 +19,7 @@
     "fastify": "^5.8.4",
     "nanoid": "^5.1.7",
     "openai": "^6.34.0",
-    "tensorlake": "file:../../../tensorlake/typescript",
+    "tensorlake": "link:../../../tensorlake/typescript",
     "ws": "^8.20.0",
     "zod": "^4.3.6"
   },

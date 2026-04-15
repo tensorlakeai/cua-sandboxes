@@ -347,6 +347,54 @@ describe("SessionManager", () => {
     expect(missing.terminatedAt).not.toBeNull();
   });
 
+  it("archives sessions when their sandbox is terminated externally", async () => {
+    const harness = await createHarness();
+    cleanups.push(harness.cleanup);
+
+    const sandbox = new FakeSandbox("sbx-external-termination", new FakeDesktop([tinyPngBytes()]));
+    harness.sandboxClient.queueSandbox(sandbox);
+    const session = await harness.manager.createSession();
+    await harness.manager.waitForIdle(session.id);
+
+    harness.sandboxClient.setStatus("sbx-external-termination", "terminated");
+    await harness.manager.reconcileSandboxStatuses();
+
+    const record = harness.store.requireSessionRecord(session.id);
+
+    expect(record.runState).toBe("terminated");
+    expect(record.sandboxStatus).toBe("terminated");
+    expect(record.terminatedAt).not.toBeNull();
+    expect(sandbox.desktop.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("rechecks sandbox status after a timeout instead of archiving immediately", async () => {
+    const harness = await createHarness();
+    cleanups.push(harness.cleanup);
+
+    const sandbox = new FakeSandbox("sbx-status-timeout", new FakeDesktop([tinyPngBytes()]));
+    harness.sandboxClient.queueSandbox(sandbox);
+    const session = await harness.manager.createSession();
+    await harness.manager.waitForIdle(session.id);
+
+    harness.sandboxClient.setStatus("sbx-status-timeout", "terminated");
+    harness.sandboxClient.get.mockRejectedValueOnce(
+      new Error("timed out while checking sandbox status"),
+    );
+
+    await harness.manager.reconcileSandboxStatuses();
+
+    const afterTimeout = harness.store.requireSessionRecord(session.id);
+    expect(afterTimeout.runState).toBe("ready");
+    expect(afterTimeout.terminatedAt).toBeNull();
+
+    await harness.manager.reconcileSandboxStatuses();
+
+    const afterRetry = harness.store.requireSessionRecord(session.id);
+    expect(afterRetry.runState).toBe("terminated");
+    expect(afterRetry.sandboxStatus).toBe("terminated");
+    expect(afterRetry.terminatedAt).not.toBeNull();
+  });
+
   it("stops in-flight runs cleanly and prevents overlapping turns", async () => {
     const harness = await createHarness();
     cleanups.push(harness.cleanup);

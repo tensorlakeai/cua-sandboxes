@@ -584,6 +584,7 @@ export default function App() {
             <div className="flex-1 overflow-hidden px-5 py-5">
               <RemoteDesktop
                 className="h-full"
+                displayPriority={0}
                 interactiveEnabled={!isDesktopOverlayOpen}
                 session={selectedSession}
                 streamEnabled
@@ -668,6 +669,7 @@ export default function App() {
             <div className="min-h-0 flex-1 p-4">
               <RemoteDesktop
                 className="h-full"
+                displayPriority={10}
                 interactiveEnabled
                 session={selectedSession}
                 streamEnabled

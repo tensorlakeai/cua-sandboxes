@@ -1,4 +1,4 @@
-import { act, render } from "@testing-library/react";
+import { act, cleanup, render, screen } from "@testing-library/react";
 import type { SessionSummary } from "@vnc-cua/contracts";
 import {
   afterEach,
@@ -47,6 +47,8 @@ vi.mock("./lib/novnc.js", () => ({
   RFB: MockRfb,
 }));
 
+let drawImageMock: ReturnType<typeof vi.fn>;
+
 function makeSession(): SessionSummary {
   return {
     id: "session-1",
@@ -65,13 +67,22 @@ describe("RemoteDesktop", () => {
   beforeEach(() => {
     mockRfbInstances.length = 0;
     vi.useFakeTimers();
+    drawImageMock = vi.fn();
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(() => (
+      { drawImage: drawImageMock } as unknown as CanvasRenderingContext2D
+    ));
+    vi.spyOn(HTMLCanvasElement.prototype, "toDataURL").mockImplementation(
+      () => "data:image/png;base64,frame",
+    );
   });
 
   afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
     vi.useRealTimers();
   });
 
-  it("reconnects automatically after the VNC stream disconnects", async () => {
+  it("reconnects automatically after the shared VNC stream disconnects", async () => {
     render(
       <RemoteDesktop
         interactiveEnabled
@@ -95,5 +106,79 @@ describe("RemoteDesktop", () => {
     expect(mockRfbInstances[1]?.urlOrChannel).toBe(
       "ws://localhost:3000/api/sessions/session-1/vnc",
     );
+  });
+
+  it("keeps the last rendered frame visible while reconnecting", async () => {
+    render(
+      <RemoteDesktop
+        interactiveEnabled
+        session={makeSession()}
+        streamEnabled
+      />,
+    );
+
+    const host = screen.getByLabelText("Interactive live desktop");
+    const sourceCanvas = document.createElement("canvas");
+    sourceCanvas.width = 1280;
+    sourceCanvas.height = 800;
+    mockRfbInstances[0]?.target.append(sourceCanvas);
+
+    await act(async () => {
+      mockRfbInstances[0]?.dispatchEvent(new Event("connect"));
+      vi.advanceTimersByTime(200);
+    });
+
+    const fallbackImage = host.querySelector("img");
+    expect(drawImageMock).toHaveBeenCalled();
+    expect(fallbackImage).toHaveClass("hidden");
+
+    await act(async () => {
+      mockRfbInstances[0]?.dispatchEvent(
+        new CustomEvent("disconnect", {
+          detail: { clean: false },
+        }),
+      );
+    });
+
+    expect(fallbackImage).not.toHaveClass("hidden");
+    expect(fallbackImage?.getAttribute("src")).toBe("data:image/png;base64,frame");
+  });
+
+  it("reuses one VNC connection while moving the live surface into the popup host", () => {
+    const session = makeSession();
+    const { rerender } = render(
+      <>
+        <RemoteDesktop
+          displayPriority={0}
+          interactiveEnabled={false}
+          session={session}
+          streamEnabled
+        />
+        <RemoteDesktop
+          displayPriority={10}
+          interactiveEnabled
+          session={session}
+          streamEnabled
+        />
+      </>,
+    );
+
+    const popupHost = screen.getByLabelText("Interactive live desktop");
+
+    expect(mockRfbInstances).toHaveLength(1);
+    expect(mockRfbInstances[0]?.target.parentElement?.parentElement).toBe(popupHost);
+
+    rerender(
+      <RemoteDesktop
+        displayPriority={0}
+        interactiveEnabled
+        session={session}
+        streamEnabled
+      />,
+    );
+
+    const returnedHost = screen.getByLabelText("Interactive live desktop");
+    expect(mockRfbInstances).toHaveLength(1);
+    expect(mockRfbInstances[0]?.target.parentElement?.parentElement).toBe(returnedHost);
   });
 });

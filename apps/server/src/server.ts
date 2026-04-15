@@ -39,6 +39,7 @@ export interface CreateAppOptions {
   openai?: OpenAIClientLike;
   sandboxClient?: SandboxClientLike;
   restoreOnStartup?: boolean;
+  statusCheckIntervalMs?: number;
   screenshotDir?: string;
   logger?: FastifyBaseLogger | boolean;
 }
@@ -80,6 +81,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<AppBund
   });
   const liveInputServer = new WebSocketServer({ noServer: true });
   const vncProxyServer = new WebSocketServer({ noServer: true });
+  const statusCheckIntervalMs = options.statusCheckIntervalMs ?? 10_000;
+  let statusCheckTimer: ReturnType<typeof setInterval> | null = null;
 
   await app.register(cors, { origin: true });
 
@@ -263,6 +266,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<AppBund
   });
 
   app.addHook("onClose", async () => {
+    if (statusCheckTimer) {
+      clearInterval(statusCheckTimer);
+      statusCheckTimer = null;
+    }
     eventBus.close();
     for (const client of liveInputServer.clients) {
       client.close();
@@ -278,6 +285,17 @@ export async function createApp(options: CreateAppOptions = {}): Promise<AppBund
 
   if (options.restoreOnStartup !== false) {
     await sessionManager.restoreSessions();
+  }
+
+  if (statusCheckIntervalMs > 0) {
+    statusCheckTimer = setInterval(() => {
+      void sessionManager.reconcileSandboxStatuses().catch((error: unknown) => {
+        if (app.log) {
+          app.log.warn({ error }, "sandbox status reconciliation failed");
+        }
+      });
+    }, statusCheckIntervalMs);
+    statusCheckTimer.unref?.();
   }
 
   return { app, sessionManager, store };

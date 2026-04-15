@@ -42,8 +42,8 @@ importers:
         specifier: ^6.34.0
         version: 6.34.0(ws@8.20.0)(zod@4.3.6)
       tensorlake:
-        specifier: file:../../../tensorlake/typescript
-        version: file:../tensorlake/typescript
+        specifier: link:../../../tensorlake/typescript
+        version: link:../../../tensorlake/typescript
       ws:
         specifier: ^8.20.0
         version: 8.20.0
@@ -1877,11 +1877,6 @@ packages:
     resolution: {integrity: sha512-ujeqbceABgwMZxEJnk2HDY2DlnUZ+9oEcb1KzTVfYHio0UE6dG71n60d8D2I4qNvleWrrXpmjpt7vZeF1LnMZQ==}
     engines: {node: '>=6'}
 
-  tensorlake@file:../tensorlake/typescript:
-    resolution: {directory: ../tensorlake/typescript, type: directory}
-    engines: {node: '>=18.0.0'}
-    hasBin: true
-
   thenify-all@1.6.0:
     resolution: {integrity: sha512-RNxQH/qI8/t3thXJDwcstUO4zeqo64+Uy/+sNVRBx4Xn2OX+OZ9oP+iJnNFqplFra2ZUVeKCSa2oVWi3T4uVmA==}
     engines: {node: '>=0.8'}
@@ -3625,13 +3620,6 @@ snapshots:
       fs-constants: 1.0.0
       inherits: 2.0.4
       readable-stream: 3.6.2
-
-  tensorlake@file:../tensorlake/typescript:
-    dependencies:
-      ws: 8.20.0
-    transitivePeerDependencies:
-      - bufferutil
-      - utf-8-validate
 
   thenify-all@1.6.0:
     dependencies:
