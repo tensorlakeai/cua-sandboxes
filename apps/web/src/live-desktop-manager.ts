@@ -1,8 +1,20 @@
+import type { LiveModifierKey } from "@vnc-cua/contracts";
+
 import { RFB } from "./lib/novnc.js";
 
 const RECONNECT_DELAY_MS = 750;
 const FALLBACK_SNAPSHOT_INTERVAL_MS = 200;
 const VNC_PASSWORD = "tensorlake";
+const NAVIGATION_KEYS = new Set([
+  "ArrowUp",
+  "ArrowDown",
+  "ArrowLeft",
+  "ArrowRight",
+  "Home",
+  "End",
+  "PageUp",
+  "PageDown",
+]);
 
 interface AttachmentOptions {
   canControl: boolean;
@@ -44,22 +56,29 @@ class ManagedDesktopConnection implements LiveDesktopHandle {
   readonly fallbackImage: HTMLImageElement;
   readonly snapshotCanvas: HTMLCanvasElement;
   readonly attachments = new Map<symbol, AttachmentRecord>();
+  readonly inputUrl: string;
   readonly vncUrl: string;
 
   private rfb: RFB | null = null;
+  private inputSocket: WebSocket | null = null;
   private reconnectTimeoutId: number | null = null;
   private snapshotTimeoutId: number | null = null;
   private nextOrder = 0;
   private disposed = false;
   private activeConnectionToken = 0;
+  private pendingInputMessages: string[] = [];
+  private wantsInteractiveFocus = false;
 
   constructor(
     private readonly sessionId: string,
     vncUrl: string,
   ) {
     this.vncUrl = vncUrl;
+    this.inputUrl = deriveInputUrl(vncUrl);
     this.stage = document.createElement("div");
     this.stage.className = "relative h-full w-full overflow-hidden bg-black";
+    this.stage.addEventListener("keydown", this.handleStageKeyDown, true);
+    this.stage.addEventListener("keyup", this.handleStageKeyUp, true);
     this.liveSurface = document.createElement("div");
     this.liveSurface.className = "absolute inset-0 h-full w-full transition-opacity duration-150";
     this.fallbackImage = document.createElement("img");
@@ -98,7 +117,11 @@ class ManagedDesktopConnection implements LiveDesktopHandle {
   }
 
   focus(): void {
-    this.rfb?.focus();
+    this.wantsInteractiveFocus = true;
+    this.ensureInputSocket();
+    if (this.rfb && !this.rfb.viewOnly) {
+      this.rfb.focus();
+    }
   }
 
   dispose(): void {
@@ -109,6 +132,9 @@ class ManagedDesktopConnection implements LiveDesktopHandle {
     this.disposed = true;
     this.clearReconnectTimer();
     this.stopSnapshotLoop();
+    this.disconnectInputSocket();
+    this.stage.removeEventListener("keydown", this.handleStageKeyDown, true);
+    this.stage.removeEventListener("keyup", this.handleStageKeyUp, true);
     this.disconnectCurrent();
     this.stage.remove();
 
@@ -128,7 +154,24 @@ class ManagedDesktopConnection implements LiveDesktopHandle {
     }
 
     if (this.rfb) {
+      const controlRestored = this.rfb.viewOnly && activeAttachment.canControl;
       this.rfb.viewOnly = !activeAttachment.canControl;
+      if (activeAttachment.canControl) {
+        this.ensureInputSocket();
+        if (controlRestored && this.wantsInteractiveFocus) {
+          queueMicrotask(() => {
+            if (this.disposed || !this.rfb || this.rfb.viewOnly) {
+              return;
+            }
+            this.rfb.focus();
+          });
+        }
+      } else {
+        if (this.stage.contains(document.activeElement)) {
+          this.wantsInteractiveFocus = true;
+        }
+        this.disconnectInputSocket();
+      }
       return;
     }
 
@@ -175,6 +218,18 @@ class ManagedDesktopConnection implements LiveDesktopHandle {
         return;
       }
       this.clearReconnectTimer();
+      const activeAttachmentAfterConnect = this.getActiveAttachment();
+      if (activeAttachmentAfterConnect?.canControl) {
+        this.ensureInputSocket();
+        if (this.wantsInteractiveFocus) {
+          queueMicrotask(() => {
+            if (this.rfb !== rfb || this.disposed || rfb.viewOnly) {
+              return;
+            }
+            rfb.focus();
+          });
+        }
+      }
       this.startSnapshotLoop();
     };
 
@@ -220,6 +275,12 @@ class ManagedDesktopConnection implements LiveDesktopHandle {
     this.rfb = null;
     this.stopSnapshotLoop();
     current?.disconnect();
+  }
+
+  private disconnectInputSocket(): void {
+    const socket = this.inputSocket;
+    this.inputSocket = null;
+    socket?.close();
   }
 
   private clearReconnectTimer(): void {
@@ -338,4 +399,129 @@ class ManagedDesktopConnection implements LiveDesktopHandle {
       // Ignore snapshot failures and continue with the current display.
     }
   }
+
+  private readonly handleStageKeyDown = (event: KeyboardEvent): void => {
+    if (!this.shouldInterceptNavigationKey(event)) {
+      return;
+    }
+
+    stopKeyboardEvent(event);
+    this.sendLiveInput({
+      type: "key_press",
+      key: event.key,
+      modifiers: modifiersFromKeyboardEvent(event),
+    });
+  };
+
+  private readonly handleStageKeyUp = (event: KeyboardEvent): void => {
+    if (!this.shouldInterceptNavigationKey(event)) {
+      return;
+    }
+
+    stopKeyboardEvent(event);
+  };
+
+  private shouldInterceptNavigationKey(event: KeyboardEvent): boolean {
+    if (!NAVIGATION_KEYS.has(event.key)) {
+      return false;
+    }
+
+    const activeAttachment = this.getActiveAttachment();
+    return !!activeAttachment?.canControl;
+  }
+
+  private ensureInputSocket(): void {
+    if (this.disposed) {
+      return;
+    }
+
+    if (
+      this.inputSocket &&
+      (this.inputSocket.readyState === WebSocket.OPEN
+        || this.inputSocket.readyState === WebSocket.CONNECTING)
+    ) {
+      return;
+    }
+
+    const socket = new WebSocket(this.inputUrl);
+    socket.addEventListener("open", () => {
+      if (this.inputSocket !== socket || this.disposed) {
+        socket.close();
+        return;
+      }
+
+      this.flushPendingInputMessages();
+    });
+    socket.addEventListener("close", () => {
+      if (this.inputSocket === socket) {
+        this.inputSocket = null;
+      }
+    });
+    socket.addEventListener("error", () => {
+      if (this.inputSocket === socket && socket.readyState !== WebSocket.OPEN) {
+        this.inputSocket = null;
+      }
+    });
+    this.inputSocket = socket;
+  }
+
+  private flushPendingInputMessages(): void {
+    if (!this.inputSocket || this.inputSocket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    while (this.pendingInputMessages.length > 0) {
+      const next = this.pendingInputMessages.shift();
+      if (next == null) {
+        break;
+      }
+      this.inputSocket.send(next);
+    }
+  }
+
+  private sendLiveInput(payload: {
+    type: "key_press";
+    key: string;
+    modifiers: LiveModifierKey[];
+  }): void {
+    const serialized = JSON.stringify(payload);
+    if (this.inputSocket?.readyState === WebSocket.OPEN) {
+      this.inputSocket.send(serialized);
+      return;
+    }
+
+    this.pendingInputMessages.push(serialized);
+    this.ensureInputSocket();
+  }
+}
+
+function deriveInputUrl(vncUrl: string): string {
+  const url = new URL(vncUrl);
+  url.pathname = url.pathname.replace(/\/vnc$/, "/input");
+  return url.toString();
+}
+
+function modifiersFromKeyboardEvent(event: KeyboardEvent): LiveModifierKey[] {
+  const modifiers: LiveModifierKey[] = [];
+
+  if (event.altKey && event.key !== "Alt") {
+    modifiers.push("Alt");
+  }
+  if (event.ctrlKey && event.key !== "Control") {
+    modifiers.push("Control");
+  }
+  if (event.metaKey && event.key !== "Meta") {
+    modifiers.push("Meta");
+  }
+  if (event.shiftKey && event.key !== "Shift") {
+    modifiers.push("Shift");
+  }
+
+  return modifiers;
+}
+
+function stopKeyboardEvent(event: KeyboardEvent): void {
+  event.preventDefault();
+  event.stopPropagation();
+  event.stopImmediatePropagation?.();
 }

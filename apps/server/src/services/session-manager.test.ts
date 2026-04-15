@@ -197,6 +197,50 @@ describe("SessionManager", () => {
     expect(messages.at(-1)?.content).toBe("Recovered after reconnect.");
   });
 
+  it("returns failed turns to ready so manual desktop control still works", async () => {
+    const harness = await createHarness();
+    cleanups.push(harness.cleanup);
+
+    const desktop = new FakeDesktop([tinyPngBytes()]);
+    desktop.press.mockRejectedValueOnce(new Error("unsupported desktop key `esc`"));
+
+    harness.sandboxClient.queueSandbox(new FakeSandbox("sbx-turn-error", desktop));
+    const session = await harness.manager.createSession();
+    await harness.manager.waitForIdle(session.id);
+
+    harness.openai.enqueueResponse(assistantResponse("title-turn-error", "Press Escape"));
+    harness.openai.enqueueResponse(
+      computerCallResponse("resp-turn-error-1", "call-turn-error-1", [
+        { type: "keypress", keys: ["esc"] },
+      ]),
+    );
+
+    harness.manager.sendUserMessage(session.id, "Press escape");
+    await harness.manager.waitForIdle(session.id);
+
+    const record = harness.store.requireSessionRecord(session.id);
+    const messages = harness.store.listMessages(session.id);
+
+    expect(record.runState).toBe("ready");
+    expect(record.title).toBe("Press Escape");
+    expect(messages.at(-1)?.kind).toBe("error");
+    expect(messages.at(-1)?.content).toBe("unsupported desktop key `esc`");
+
+    await harness.manager.handleLiveDesktopInput(session.id, {
+      type: "click",
+      x: 24,
+      y: 32,
+      button: "left",
+      clickCount: 1,
+    });
+
+    expect(desktop.click).toHaveBeenCalledWith({
+      button: "left",
+      x: 24,
+      y: 32,
+    });
+  });
+
   it("falls back to the cached frame when no fresher frame arrives in time", async () => {
     const harness = await createHarness();
     cleanups.push(harness.cleanup);

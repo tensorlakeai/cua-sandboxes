@@ -570,7 +570,7 @@ export class SessionManager {
         await this.handleAbort(sessionId);
         return;
       }
-      await this.handleFailure(sessionId, error);
+      await this.handleFailure(sessionId, error, { nextRunState: "ready" });
     }
   }
 
@@ -646,7 +646,11 @@ export class SessionManager {
     this.publishSession(ready);
   }
 
-  private async handleFailure(sessionId: string, error: unknown): Promise<void> {
+  private async handleFailure(
+    sessionId: string,
+    error: unknown,
+    options: { nextRunState: "ready" | "error" },
+  ): Promise<void> {
     const record = this.options.store.requireSessionRecord(sessionId);
     if (record.terminatedAt) {
       return;
@@ -671,9 +675,9 @@ export class SessionManager {
     });
 
     const updated = this.options.store.updateSession(sessionId, {
-      runState: "error",
+      runState: options.nextRunState,
     });
-    this.publishRunState(sessionId, "error");
+    this.publishRunState(sessionId, options.nextRunState);
     this.publishSession(updated);
   }
 
@@ -705,7 +709,7 @@ export class SessionManager {
       if (error instanceof RunAbortedError || isAbortLikeError(error, runtime)) {
         return;
       }
-      await this.handleFailure(sessionId, error);
+      await this.handleFailure(sessionId, error, { nextRunState: "error" });
     }
   }
 

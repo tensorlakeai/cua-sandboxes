@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { SessionSummary } from "@vnc-cua/contracts";
 import {
   afterEach,
@@ -11,8 +11,9 @@ import {
 
 import { RemoteDesktop } from "./RemoteDesktop.js";
 
-const { mockRfbInstances, MockRfb } = vi.hoisted(() => {
+const { mockRfbInstances, mockWebSocketInstances, MockRfb, MockWebSocket } = vi.hoisted(() => {
   const instances: MockRfb[] = [];
+  const sockets: MockWebSocket[] = [];
 
   class HoistedMockRfb extends EventTarget {
     background = "";
@@ -37,9 +38,42 @@ const { mockRfbInstances, MockRfb } = vi.hoisted(() => {
 
   type MockRfb = HoistedMockRfb;
 
+  class HoistedMockWebSocket extends EventTarget {
+    static readonly CONNECTING = 0;
+    static readonly OPEN = 1;
+    static readonly CLOSING = 2;
+    static readonly CLOSED = 3;
+
+    readonly sent = vi.fn();
+    readyState = HoistedMockWebSocket.CONNECTING;
+
+    constructor(public readonly url: string) {
+      super();
+      sockets.push(this as unknown as MockWebSocket);
+    }
+
+    send(data: string) {
+      this.sent(data);
+    }
+
+    close() {
+      this.readyState = HoistedMockWebSocket.CLOSED;
+      this.dispatchEvent(new Event("close"));
+    }
+
+    open() {
+      this.readyState = HoistedMockWebSocket.OPEN;
+      this.dispatchEvent(new Event("open"));
+    }
+  }
+
+  type MockWebSocket = HoistedMockWebSocket;
+
   return {
     mockRfbInstances: instances,
+    mockWebSocketInstances: sockets,
     MockRfb: HoistedMockRfb,
+    MockWebSocket: HoistedMockWebSocket,
   };
 });
 
@@ -49,24 +83,26 @@ vi.mock("./lib/novnc.js", () => ({
 
 let drawImageMock: ReturnType<typeof vi.fn>;
 
-function makeSession(): SessionSummary {
+function makeSession(overrides: Partial<SessionSummary> = {}): SessionSummary {
   return {
-    id: "session-1",
-    title: "Sandbox 1",
-    sandboxId: "sbx-session-1",
-    sandboxStatus: "running",
-    runState: "ready",
-    lastScreenshotRevision: 1,
-    createdAt: "2026-04-13T12:00:00.000Z",
-    updatedAt: "2026-04-13T12:00:10.000Z",
-    terminatedAt: null,
+    id: overrides.id ?? "session-1",
+    title: overrides.title ?? "Sandbox 1",
+    sandboxId: overrides.sandboxId ?? "sbx-session-1",
+    sandboxStatus: overrides.sandboxStatus ?? "running",
+    runState: overrides.runState ?? "ready",
+    lastScreenshotRevision: overrides.lastScreenshotRevision ?? 1,
+    createdAt: overrides.createdAt ?? "2026-04-13T12:00:00.000Z",
+    updatedAt: overrides.updatedAt ?? "2026-04-13T12:00:10.000Z",
+    terminatedAt: overrides.terminatedAt ?? null,
   };
 }
 
 describe("RemoteDesktop", () => {
   beforeEach(() => {
     mockRfbInstances.length = 0;
+    mockWebSocketInstances.length = 0;
     vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", MockWebSocket);
     drawImageMock = vi.fn();
     vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(() => (
       { drawImage: drawImageMock } as unknown as CanvasRenderingContext2D
@@ -78,6 +114,7 @@ describe("RemoteDesktop", () => {
 
   afterEach(() => {
     cleanup();
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
     vi.useRealTimers();
   });
@@ -142,6 +179,85 @@ describe("RemoteDesktop", () => {
 
     expect(fallbackImage).not.toHaveClass("hidden");
     expect(fallbackImage?.getAttribute("src")).toBe("data:image/png;base64,frame");
+  });
+
+  it("routes navigation keys through the input socket as real arrow presses", async () => {
+    render(
+      <RemoteDesktop
+        interactiveEnabled
+        session={makeSession()}
+        streamEnabled
+      />,
+    );
+
+    const host = screen.getByLabelText("Interactive live desktop");
+    fireEvent.mouseDown(host);
+
+    expect(mockWebSocketInstances).toHaveLength(1);
+    mockWebSocketInstances[0]?.open();
+    const stage = host.firstElementChild as HTMLElement;
+
+    const event = new KeyboardEvent("keydown", {
+      key: "ArrowDown",
+      bubbles: true,
+      cancelable: true,
+      shiftKey: true,
+    });
+
+    stage.dispatchEvent(event);
+
+    expect(mockWebSocketInstances[0]?.url).toBe(
+      "ws://localhost:3000/api/sessions/session-1/input",
+    );
+    expect(mockWebSocketInstances[0]?.sent).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: "key_press",
+        key: "ArrowDown",
+        modifiers: ["Shift"],
+      }),
+    );
+  });
+
+  it("restores interactive focus after a run switches the desktop back from view-only", async () => {
+    const { rerender } = render(
+      <RemoteDesktop
+        interactiveEnabled
+        session={makeSession({ runState: "ready" })}
+        streamEnabled
+      />,
+    );
+
+    const interactiveHost = screen.getByLabelText("Interactive live desktop");
+    fireEvent.mouseDown(interactiveHost);
+
+    expect(mockRfbInstances[0]?.focus).toHaveBeenCalledTimes(1);
+    expect(mockRfbInstances[0]?.viewOnly).toBe(false);
+
+    rerender(
+      <RemoteDesktop
+        interactiveEnabled
+        session={makeSession({ runState: "running" })}
+        streamEnabled
+      />,
+    );
+
+    expect(screen.getByLabelText("Live desktop")).toBeInTheDocument();
+    expect(mockRfbInstances[0]?.viewOnly).toBe(true);
+
+    await act(async () => {
+      rerender(
+        <RemoteDesktop
+          interactiveEnabled
+          session={makeSession({ runState: "ready" })}
+          streamEnabled
+        />,
+      );
+      await Promise.resolve();
+    });
+
+    expect(screen.getByLabelText("Interactive live desktop")).toBeInTheDocument();
+    expect(mockRfbInstances[0]?.viewOnly).toBe(false);
+    expect(mockRfbInstances[0]?.focus).toHaveBeenCalledTimes(2);
   });
 
   it("reuses one VNC connection while moving the live surface into the popup host", () => {
