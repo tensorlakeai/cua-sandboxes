@@ -10,9 +10,10 @@ import {
 import { createDatabase } from "../db/client.js";
 import { EventBus } from "../lib/event-bus.js";
 import { SessionManager } from "./session-manager.js";
-import { SessionStore } from "./session-store.js";
+import { SessionStore, type SessionProvider } from "./session-store.js";
 import {
   FakeDesktop,
+  FakeGemini,
   FakeOpenAI,
   FakeSandbox,
   FakeSandboxClient,
@@ -20,20 +21,25 @@ import {
   cleanupWorkspace,
   computerCallResponse,
   createTempWorkspace,
+  geminiTextResponse,
   tinyPngBytes,
 } from "../test/test-helpers.js";
 
-async function createHarness() {
+async function createHarness(options: { provider?: SessionProvider } = {}) {
   const workspace = await createTempWorkspace("vnc-cua-session-manager-");
   const { sqlite, db } = createDatabase(workspace.dbPath);
   const store = new SessionStore(db);
   const eventBus = new EventBus();
+  const provider = options.provider ?? "openai";
   const openai = new FakeOpenAI();
+  const gemini = new FakeGemini();
   const sandboxClient = new FakeSandboxClient();
   const manager = new SessionManager({
     store,
     eventBus,
     openai,
+    gemini,
+    defaultProvider: provider,
     sandboxClient,
     screenshotDir: workspace.screenshotDir,
     desktopBootWaitMs: 0,
@@ -43,6 +49,7 @@ async function createHarness() {
     ...workspace,
     store,
     openai,
+    gemini,
     sandboxClient,
     manager,
     async cleanup() {
@@ -142,6 +149,7 @@ describe("SessionManager", () => {
     ]);
     expect(record.title).toBe("Open Window");
     expect(record.runState).toBe("ready");
+    expect(record.providerState).toBe("resp-2");
     expect(record.openaiLastResponseId).toBe("resp-2");
     expect(record.lastScreenshotRevision).toBe(2);
     expect(secondCall.previous_response_id).toBe("resp-1");
@@ -152,6 +160,66 @@ describe("SessionManager", () => {
     expect(secondCall.input[0]?.output.image_url.startsWith("data:image/png;base64,")).toBe(
       true,
     );
+  });
+
+  it("runs the Gemini computer-use loop with screenshot feedback", async () => {
+    const harness = await createHarness({ provider: "gemini" });
+    cleanups.push(harness.cleanup);
+
+    const desktop = new FakeDesktop([tinyPngBytes(), tinyPngBytes()]);
+    harness.sandboxClient.queueSandbox(new FakeSandbox("sbx-gemini-loop", desktop));
+    const session = await harness.manager.createSession();
+    await harness.manager.waitForIdle(session.id);
+
+    harness.gemini?.enqueueResponse(geminiTextResponse("Open Firefox"));
+    harness.gemini?.enqueueResponse(
+      geminiTextResponse("I'll click Firefox.", {
+        functionCalls: [
+          {
+            id: "call-g1",
+            name: "click_at",
+            args: { x: 500, y: 400 },
+          },
+        ],
+      }),
+    );
+    harness.gemini?.enqueueResponse(geminiTextResponse("Firefox opened."));
+
+    harness.manager.sendUserMessage(session.id, "Open Firefox");
+    await harness.manager.waitForIdle(session.id);
+
+    const messages = harness.store.listMessages(session.id);
+    const record = harness.store.requireSessionRecord(session.id);
+    const secondCall = harness.gemini?.models.generateContent.mock.calls[1]?.[0] as {
+      model: string;
+      config: { tools: Array<{ computerUse: { excludedPredefinedFunctions: string[] } }> };
+      contents: Array<{
+        role: string;
+        parts: Array<{ text?: string; inlineData?: { mimeType?: string } }>;
+      }>;
+    };
+    expect(record.provider).toBe("gemini");
+    expect(record.title).toBe("Open Firefox");
+    expect(record.runState).toBe("ready");
+    expect(record.providerState).toBeNull();
+    expect(desktop.click).toHaveBeenCalledWith({
+      button: "left",
+      x: 500,
+      y: 400,
+    });
+    expect(messages.map((message) => [message.role, message.kind, message.content])).toEqual([
+      ["user", "text", "Open Firefox"],
+      ["system", "status", "Capturing screenshot..."],
+      ["assistant", "text", "I'll click Firefox."],
+      ["system", "status", "Agent actions:\n1. Click left at (500, 400)"],
+      ["system", "status", "Capturing screenshot..."],
+      ["assistant", "text", "Firefox opened."],
+    ]);
+    expect(secondCall.model).toBe("gemini-3-flash-preview");
+    expect(
+      secondCall.config.tools[0]?.computerUse.excludedPredefinedFunctions,
+    ).toEqual(["open_web_browser", "search", "navigate", "go_back", "go_forward"]);
+    expect(harness.gemini?.models.generateContent).toHaveBeenCalledTimes(3);
   });
 
   it("reconnects the desktop when the tunnel drops during a run", async () => {
@@ -357,6 +425,7 @@ describe("SessionManager", () => {
     harness.store.createSession({
       id: "session-running",
       title: "Running",
+      provider: "openai",
       sandboxId: "sbx-running",
       sandboxStatus: "running",
       runState: "pending",
@@ -364,6 +433,7 @@ describe("SessionManager", () => {
     harness.store.createSession({
       id: "session-missing",
       title: "Missing",
+      provider: "openai",
       sandboxId: "sbx-missing",
       sandboxStatus: "running",
       runState: "pending",

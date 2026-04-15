@@ -7,6 +7,8 @@ import {
 export const sessionsTable = sqliteTable("sessions", {
   id: text("id").primaryKey(),
   title: text("title").notNull(),
+  provider: text("provider").notNull().default("openai"),
+  providerState: text("provider_state"),
   sandboxId: text("sandbox_id"),
   sandboxStatus: text("sandbox_status").notNull(),
   runState: text("run_state").notNull(),

@@ -2,9 +2,15 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import {
+  type ChatMessage,
   type LiveDesktopInputEvent,
   type SessionSummary,
 } from "@vnc-cua/contracts";
+import {
+  Environment,
+  type GenerateContentParameters,
+  type GenerateContentResponse,
+} from "@google/genai";
 
 import {
   type ComputerAction,
@@ -16,6 +22,7 @@ import {
 import {
   SessionStore,
   toSessionSummary,
+  type SessionProvider,
   type SessionRecord,
 } from "./session-store.js";
 import { EventBus } from "../lib/event-bus.js";
@@ -70,6 +77,55 @@ export interface OpenAIClientLike {
   };
 }
 
+export interface GeminiFunctionCallLike {
+  id?: string;
+  name?: string;
+  args?: Record<string, unknown>;
+}
+
+export interface GeminiContentLike {
+  role?: string;
+  parts?: Array<{
+    text?: string;
+    functionCall?: GeminiFunctionCallLike;
+    functionResponse?: {
+      id?: string;
+      name?: string;
+      response?: Record<string, unknown>;
+      parts?: Array<{
+        inlineData?: {
+          mimeType?: string;
+          data?: string;
+        };
+      }>;
+    };
+    inlineData?: {
+      mimeType?: string;
+      data?: string;
+    };
+  }>;
+}
+
+export interface SimpleGeminiGenerateContentResponseLike {
+  text?: string;
+  functionCalls?: GeminiFunctionCallLike[];
+  candidates?: Array<{
+    content?: GeminiContentLike;
+  }>;
+}
+
+export type GeminiGenerateContentResponseLike =
+  | GenerateContentResponse
+  | SimpleGeminiGenerateContentResponseLike;
+
+export interface GeminiClientLike {
+  models: {
+    generateContent(
+      body: GenerateContentParameters,
+    ): Promise<GeminiGenerateContentResponseLike>;
+  };
+}
+
 interface ActiveRuntime {
   sandbox: SandboxLike;
   desktop: DesktopSessionLike | null;
@@ -90,6 +146,7 @@ class RunAbortedError extends Error {
 }
 
 const OPENAI_MODEL = "gpt-5.4";
+const GEMINI_MODEL = "gemini-3-flash-preview";
 const UNTITLED_SESSION_TITLE = "New sandbox";
 const MAX_SESSION_TITLE_LENGTH = 48;
 const LIVE_STREAM_FRAME_DELAY_MS = 120;
@@ -111,7 +168,9 @@ export class SessionManager {
   constructor(private readonly options: {
     store: SessionStore;
     eventBus: EventBus;
-    openai: OpenAIClientLike;
+    defaultProvider: SessionProvider;
+    openai: OpenAIClientLike | undefined;
+    gemini: GeminiClientLike | undefined;
     sandboxClient: SandboxClientLike;
     screenshotDir: string;
     desktopBootWaitMs?: number;
@@ -155,6 +214,7 @@ export class SessionManager {
       const session = this.options.store.createSession({
         id: sessionId,
         title: UNTITLED_SESSION_TITLE,
+        provider: this.options.defaultProvider,
         sandboxId: sandbox.sandboxId,
         sandboxStatus: "running",
         runState: "pending",
@@ -458,106 +518,10 @@ export class SessionManager {
 
       let record = this.options.store.requireSessionRecord(sessionId);
       record = await this.maybeGenerateSessionTitle(record, userContent, runtime);
-      let response = await this.options.openai.responses.create(
-        {
-          model: OPENAI_MODEL,
-          tools: [{ type: "computer" }],
-          ...(record.openaiLastResponseId
-            ? {
-                previous_response_id: record.openaiLastResponseId,
-                input: [
-                  {
-                    role: "user",
-                    content: [{ type: "input_text", text: userContent }],
-                  },
-                ],
-              }
-            : {
-                input: [
-                  {
-                    role: "system",
-                    content: [{ type: "input_text", text: SYSTEM_PROMPT }],
-                  },
-                  {
-                    role: "user",
-                    content: [{ type: "input_text", text: userContent }],
-                  },
-                ],
-              }),
-        },
-        runtime.abortController?.signal
-          ? { signal: runtime.abortController.signal }
-          : undefined,
-      );
-      record = this.options.store.updateSession(sessionId, {
-        openaiLastResponseId: response.id,
-      });
-      this.publishSession(record);
-
-      while (true) {
-        this.throwIfStopped(runtime);
-
-        const assistantText = extractAssistantText(response).trim();
-        if (assistantText) {
-          this.publishAssistantText(sessionId, assistantText);
-        }
-
-        const computerCall = findComputerCall(response);
-        if (!computerCall) {
-          break;
-        }
-
-        const desktop = runtime.desktop;
-        if (!desktop) {
-          throw new Error(`Session ${sessionId} lost its desktop connection`);
-        }
-
-        let frameVersionBeforeActions: number | undefined = getDesktopFrameVersion(desktop);
-        this.publishStatus(sessionId, describeComputerActions(computerCall.actions));
-
-        try {
-          await executeComputerActions(desktop, computerCall.actions);
-        } catch (error) {
-          if (!isRecoverableDesktopRuntimeError(error)) {
-            throw error;
-          }
-          await this.reconnectDesktop(runtime, runtime.abortController?.signal);
-          frameVersionBeforeActions = undefined;
-        }
-        this.throwIfStopped(runtime);
-
-        this.publishStatus(sessionId, "Capturing screenshot...");
-        const { bytes } = await this.captureRuntimeScreenshot(sessionId, runtime, {
-          preferFrameAfterVersion: frameVersionBeforeActions,
-        });
-        const screenshotBase64 = Buffer.from(bytes).toString("base64");
-
-        response = await this.options.openai.responses.create(
-          {
-            model: OPENAI_MODEL,
-            tools: [{ type: "computer" }],
-            previous_response_id: response.id,
-            input: [
-              {
-                type: "computer_call_output",
-                call_id: computerCall.callId,
-                output: {
-                  type: "computer_screenshot",
-                  image_url: `data:image/png;base64,${screenshotBase64}`,
-                  detail: "original",
-                },
-              },
-            ],
-          },
-          runtime.abortController?.signal
-            ? { signal: runtime.abortController.signal }
-            : undefined,
-        );
-
-        record = this.options.store.updateSession(sessionId, {
-          openaiLastResponseId: response.id,
-        });
-        this.publishSession(record);
+      if (record.provider === "gemini") {
+        await this.runGeminiTurn(sessionId, userContent, runtime);
+      } else {
+        await this.runOpenAITurn(sessionId, userContent, runtime);
       }
 
       const ready = this.options.store.updateSession(sessionId, {
@@ -579,31 +543,16 @@ export class SessionManager {
     userContent: string,
     runtime: ActiveRuntime,
   ): Promise<SessionRecord> {
-    if (record.openaiLastResponseId || !isDefaultSessionTitle(record.title)) {
+    if (record.providerState || !isDefaultSessionTitle(record.title)) {
       return record;
     }
 
     try {
-      const response = await this.options.openai.responses.create(
-        {
-          model: OPENAI_MODEL,
-          input: [
-            {
-              role: "system",
-              content: [{ type: "input_text", text: SESSION_TITLE_PROMPT }],
-            },
-            {
-              role: "user",
-              content: [{ type: "input_text", text: userContent }],
-            },
-          ],
-        },
-        runtime.abortController?.signal
-          ? { signal: runtime.abortController.signal }
-          : undefined,
+      const title = sanitizeSessionTitle(
+        record.provider === "gemini"
+          ? await this.generateGeminiSessionTitle(userContent, runtime)
+          : await this.generateOpenAISessionTitle(userContent, runtime),
       );
-
-      const title = sanitizeSessionTitle(extractAssistantText(response));
       if (!title || title === record.title) {
         return record;
       }
@@ -620,6 +569,331 @@ export class SessionManager {
 
       return record;
     }
+  }
+
+  private async runOpenAITurn(
+    sessionId: string,
+    userContent: string,
+    runtime: ActiveRuntime,
+  ): Promise<void> {
+    const openai = this.requireOpenAI();
+    let record = this.options.store.requireSessionRecord(sessionId);
+    let response = await openai.responses.create(
+      {
+        model: OPENAI_MODEL,
+        tools: [{ type: "computer" }],
+        ...(record.providerState
+          ? {
+              previous_response_id: record.providerState,
+              input: [
+                {
+                  role: "user",
+                  content: [{ type: "input_text", text: userContent }],
+                },
+              ],
+            }
+          : {
+              input: [
+                {
+                  role: "system",
+                  content: [{ type: "input_text", text: SYSTEM_PROMPT }],
+                },
+                {
+                  role: "user",
+                  content: [{ type: "input_text", text: userContent }],
+                },
+              ],
+            }),
+      },
+      runtime.abortController?.signal
+        ? { signal: runtime.abortController.signal }
+        : undefined,
+    );
+    record = this.options.store.updateSession(sessionId, {
+      providerState: response.id,
+      openaiLastResponseId: response.id,
+    });
+    this.publishSession(record);
+
+    while (true) {
+      this.throwIfStopped(runtime);
+
+      const assistantText = extractAssistantText(response).trim();
+      if (assistantText) {
+        this.publishAssistantText(sessionId, assistantText);
+      }
+
+      const computerCall = findComputerCall(response);
+      if (!computerCall) {
+        break;
+      }
+
+      const screenshot = await this.executeActionsAndCaptureScreenshot(
+        sessionId,
+        runtime,
+        computerCall.actions,
+      );
+
+      response = await openai.responses.create(
+        {
+          model: OPENAI_MODEL,
+          tools: [{ type: "computer" }],
+          previous_response_id: response.id,
+          input: [
+            {
+              type: "computer_call_output",
+              call_id: computerCall.callId,
+              output: {
+                type: "computer_screenshot",
+                image_url: `data:image/png;base64,${screenshot.base64}`,
+                detail: "original",
+              },
+            },
+          ],
+        },
+        runtime.abortController?.signal
+          ? { signal: runtime.abortController.signal }
+          : undefined,
+      );
+
+      record = this.options.store.updateSession(sessionId, {
+        providerState: response.id,
+        openaiLastResponseId: response.id,
+      });
+      this.publishSession(record);
+    }
+  }
+
+  private async runGeminiTurn(
+    sessionId: string,
+    userContent: string,
+    runtime: ActiveRuntime,
+  ): Promise<void> {
+    const gemini = this.requireGemini();
+    const priorMessages = this.options.store.listMessages(sessionId).slice(0, -1);
+    const contents = buildGeminiContentsFromMessages(priorMessages);
+    let currentViewport = { width: 1000, height: 1000 };
+    const initialScreenshot = await this.captureInitialGeminiScreenshot(
+      sessionId,
+      runtime,
+    );
+    currentViewport = initialScreenshot.viewport;
+    contents.push({
+      role: "user",
+      parts: [
+        {
+          text: userContent,
+        },
+        {
+          inlineData: {
+            mimeType: "image/png",
+            data: initialScreenshot.base64,
+          },
+        },
+      ],
+    });
+
+    while (true) {
+      this.throwIfStopped(runtime);
+
+      const response = await gemini.models.generateContent({
+        model: GEMINI_MODEL,
+        contents,
+        config: {
+          ...(runtime.abortController?.signal
+            ? { abortSignal: runtime.abortController.signal }
+            : {}),
+          systemInstruction: SYSTEM_PROMPT,
+          tools: [
+            {
+              computerUse: {
+                environment: Environment.ENVIRONMENT_BROWSER,
+                excludedPredefinedFunctions: [
+                  "open_web_browser",
+                  "search",
+                  "navigate",
+                  "go_back",
+                  "go_forward",
+                ],
+              },
+            },
+          ],
+        },
+      });
+
+      const assistantText = extractGeminiAssistantText(response).trim();
+      if (assistantText) {
+        this.publishAssistantText(sessionId, assistantText);
+      }
+
+      const candidateContent = getGeminiCandidateContent(response);
+      if (candidateContent) {
+        contents.push(candidateContent);
+      }
+
+      const functionCalls = extractGeminiFunctionCalls(response);
+      if (functionCalls.length === 0) {
+        break;
+      }
+
+      const safetyDecision = findGeminiSafetyDecision(functionCalls);
+      if (safetyDecision) {
+        this.publishAssistantText(
+          sessionId,
+          safetyDecision.explanation ||
+            "Gemini requested user confirmation before continuing, and confirmation handling is not implemented in this app yet.",
+        );
+        break;
+      }
+
+      const actions = functionCalls.flatMap((functionCall) =>
+        normalizeGeminiFunctionCall(functionCall, currentViewport),
+      );
+      const screenshot = await this.executeActionsAndCaptureScreenshot(
+        sessionId,
+        runtime,
+        actions,
+      );
+      currentViewport = screenshot.viewport;
+
+      contents.push({
+        role: "user",
+        parts: functionCalls.map((functionCall, index) => {
+          const functionName = functionCall.name ?? "computer_action";
+          return {
+            functionResponse: {
+              id: functionCall.id ?? `${functionName}-${index + 1}`,
+              name: functionName,
+              response: {
+                output: {
+                  ok: true,
+                },
+              },
+              parts: [
+                {
+                  inlineData: {
+                    mimeType: "image/png",
+                    data: screenshot.base64,
+                  },
+                },
+              ],
+            },
+          };
+        }),
+      });
+    }
+  }
+
+  private async generateOpenAISessionTitle(
+    userContent: string,
+    runtime: ActiveRuntime,
+  ): Promise<string> {
+    const openai = this.requireOpenAI();
+    const response = await openai.responses.create(
+      {
+        model: OPENAI_MODEL,
+        input: [
+          {
+            role: "system",
+            content: [{ type: "input_text", text: SESSION_TITLE_PROMPT }],
+          },
+          {
+            role: "user",
+            content: [{ type: "input_text", text: userContent }],
+          },
+        ],
+      },
+      runtime.abortController?.signal
+        ? { signal: runtime.abortController.signal }
+        : undefined,
+    );
+
+    return extractAssistantText(response);
+  }
+
+  private async generateGeminiSessionTitle(
+    userContent: string,
+    runtime: ActiveRuntime,
+  ): Promise<string> {
+    const gemini = this.requireGemini();
+    const response = await gemini.models.generateContent({
+      model: GEMINI_MODEL,
+      contents: userContent,
+      config: {
+        ...(runtime.abortController?.signal
+          ? { abortSignal: runtime.abortController.signal }
+          : {}),
+        systemInstruction: SESSION_TITLE_PROMPT,
+      },
+    });
+
+    return extractGeminiAssistantText(response);
+  }
+
+  private async captureInitialGeminiScreenshot(
+    sessionId: string,
+    runtime: ActiveRuntime,
+  ): Promise<{
+    base64: string;
+    viewport: { width: number; height: number };
+  }> {
+    this.publishStatus(sessionId, "Capturing screenshot...");
+    const { bytes } = await this.captureRuntimeScreenshot(sessionId, runtime);
+    return {
+      base64: Buffer.from(bytes).toString("base64"),
+      viewport: getPngDimensions(bytes),
+    };
+  }
+
+  private async executeActionsAndCaptureScreenshot(
+    sessionId: string,
+    runtime: ActiveRuntime,
+    actions: ComputerAction[],
+  ): Promise<{
+    base64: string;
+    viewport: { width: number; height: number };
+  }> {
+    const desktop = runtime.desktop;
+    if (!desktop) {
+      throw new Error(`Session ${sessionId} lost its desktop connection`);
+    }
+
+    let frameVersionBeforeActions: number | undefined = getDesktopFrameVersion(desktop);
+    this.publishStatus(sessionId, describeComputerActions(actions));
+
+    try {
+      await executeComputerActions(desktop, actions);
+    } catch (error) {
+      if (!isRecoverableDesktopRuntimeError(error)) {
+        throw error;
+      }
+      await this.reconnectDesktop(runtime, runtime.abortController?.signal);
+      frameVersionBeforeActions = undefined;
+    }
+    this.throwIfStopped(runtime);
+
+    this.publishStatus(sessionId, "Capturing screenshot...");
+    const { bytes } = await this.captureRuntimeScreenshot(sessionId, runtime, {
+      preferFrameAfterVersion: frameVersionBeforeActions,
+    });
+    return {
+      base64: Buffer.from(bytes).toString("base64"),
+      viewport: getPngDimensions(bytes),
+    };
+  }
+
+  private requireOpenAI(): OpenAIClientLike {
+    if (!this.options.openai) {
+      throw new Error("OPENAI_KEY is not configured for this session");
+    }
+    return this.options.openai;
+  }
+
+  private requireGemini(): GeminiClientLike {
+    if (!this.options.gemini) {
+      throw new Error("GEMINI_KEY is not configured for this session");
+    }
+    return this.options.gemini;
   }
 
   private async handleAbort(sessionId: string): Promise<void> {
@@ -1180,6 +1454,273 @@ function findComputerCall(
   }
 
   return null;
+}
+
+function buildGeminiContentsFromMessages(messages: ChatMessage[]): GeminiContentLike[] {
+  const contents: GeminiContentLike[] = [];
+
+  for (const message of messages) {
+    if (message.kind !== "text") {
+      continue;
+    }
+
+    if (message.role !== "user" && message.role !== "assistant") {
+      continue;
+    }
+
+    const role = message.role === "assistant" ? "model" : "user";
+    const lastContent = contents.at(-1);
+    if (lastContent?.role === role) {
+      lastContent.parts ??= [];
+      lastContent.parts.push({ text: message.content });
+      continue;
+    }
+
+    contents.push({
+      role,
+      parts: [{ text: message.content }],
+    });
+  }
+
+  return contents;
+}
+
+function extractGeminiAssistantText(response: GeminiGenerateContentResponseLike): string {
+  if (typeof response.text === "string" && response.text.trim()) {
+    return response.text;
+  }
+
+  const candidateContent = getGeminiCandidateContent(response);
+  const texts =
+    candidateContent?.parts
+      ?.flatMap((part) => (typeof part.text === "string" ? [part.text] : []))
+      .filter((text) => text.trim().length > 0) ?? [];
+
+  return texts.join("\n\n");
+}
+
+function getGeminiCandidateContent(
+  response: GeminiGenerateContentResponseLike,
+): GeminiContentLike | null {
+  const candidate = response.candidates?.[0];
+  return candidate?.content ?? null;
+}
+
+function extractGeminiFunctionCalls(
+  response: GeminiGenerateContentResponseLike,
+): GeminiFunctionCallLike[] {
+  if (Array.isArray(response.functionCalls) && response.functionCalls.length > 0) {
+    return response.functionCalls;
+  }
+
+  const candidateContent = getGeminiCandidateContent(response);
+  return (
+    candidateContent?.parts
+      ?.flatMap((part) => (part.functionCall ? [part.functionCall] : []))
+      .filter((call): call is GeminiFunctionCallLike => typeof call.name === "string") ?? []
+  );
+}
+
+function findGeminiSafetyDecision(
+  functionCalls: GeminiFunctionCallLike[],
+): { decision: string; explanation?: string } | null {
+  for (const functionCall of functionCalls) {
+    const safetyDecision = functionCall.args?.safety_decision;
+    if (
+      safetyDecision &&
+      typeof safetyDecision === "object" &&
+      "decision" in safetyDecision &&
+      typeof safetyDecision.decision === "string"
+    ) {
+      const decision = safetyDecision as {
+        decision: string;
+        explanation?: unknown;
+      };
+      if (decision.decision !== "require_confirmation") {
+        continue;
+      }
+      return {
+        decision: decision.decision,
+        ...(typeof decision.explanation === "string"
+          ? { explanation: decision.explanation }
+          : {}),
+      };
+    }
+  }
+
+  return null;
+}
+
+function normalizeGeminiFunctionCall(
+  functionCall: GeminiFunctionCallLike,
+  viewport: { width: number; height: number },
+): ComputerAction[] {
+  const args = functionCall.args ?? {};
+
+  switch (functionCall.name) {
+    case "click_at":
+      return [
+        {
+          type: "click",
+          x: scaleGeminiCoordinate(args.x, viewport.width),
+          y: scaleGeminiCoordinate(args.y, viewport.height),
+        },
+      ];
+    case "hover_at":
+      return [
+        {
+          type: "move",
+          x: scaleGeminiCoordinate(args.x, viewport.width),
+          y: scaleGeminiCoordinate(args.y, viewport.height),
+        },
+      ];
+    case "type_text_at": {
+      const x = scaleGeminiCoordinate(args.x, viewport.width);
+      const y = scaleGeminiCoordinate(args.y, viewport.height);
+      const text = typeof args.text === "string" ? args.text : "";
+      const clearBeforeTyping =
+        typeof args.clear_before_typing === "boolean"
+          ? args.clear_before_typing
+          : true;
+      const pressEnter =
+        typeof args.press_enter === "boolean" ? args.press_enter : true;
+
+      return [
+        {
+          type: "click",
+          x,
+          y,
+        },
+        ...(clearBeforeTyping
+          ? [
+              {
+                type: "keypress" as const,
+                keys: ["control", "a"],
+              },
+              {
+                type: "keypress" as const,
+                keys: ["backspace"],
+              },
+            ]
+          : []),
+        ...(text
+          ? [
+              {
+                type: "type" as const,
+                text,
+              },
+            ]
+          : []),
+        ...(pressEnter
+          ? [
+              {
+                type: "keypress" as const,
+                keys: ["enter"],
+              },
+            ]
+          : []),
+      ];
+    }
+    case "key_combination":
+      return [
+        {
+          type: "keypress",
+          keys: parseGeminiKeyCombination(args.keys),
+        },
+      ];
+    case "scroll_document":
+      return [
+        {
+          type: "scroll",
+          x: Math.round(viewport.width / 2),
+          y: Math.round(viewport.height / 2),
+          scrollY: directionToScrollDelta(args.direction, 800),
+        },
+      ];
+    case "scroll_at":
+      return [
+        {
+          type: "scroll",
+          x: scaleGeminiCoordinate(args.x, viewport.width),
+          y: scaleGeminiCoordinate(args.y, viewport.height),
+          scrollY: directionToScrollDelta(
+            args.direction,
+            scaleGeminiCoordinate(args.magnitude ?? 800, viewport.height),
+          ),
+        },
+      ];
+    case "drag_and_drop":
+      return [
+        {
+          type: "drag",
+          path: [
+            [
+              scaleGeminiCoordinate(args.x, viewport.width),
+              scaleGeminiCoordinate(args.y, viewport.height),
+            ],
+            [
+              scaleGeminiCoordinate(args.destination_x, viewport.width),
+              scaleGeminiCoordinate(args.destination_y, viewport.height),
+            ],
+          ],
+        },
+      ];
+    case "wait_5_seconds":
+      return [
+        { type: "wait" },
+        { type: "wait" },
+        { type: "wait" },
+      ];
+    default:
+      throw new Error(`Unsupported Gemini computer action \`${functionCall.name ?? "unknown"}\``);
+  }
+}
+
+function scaleGeminiCoordinate(value: unknown, size: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error("Gemini computer action is missing a valid coordinate");
+  }
+
+  const clamped = Math.max(0, Math.min(999, Math.round(value)));
+  if (size <= 1) {
+    return clamped;
+  }
+
+  return Math.round((clamped / 999) * (size - 1));
+}
+
+function directionToScrollDelta(direction: unknown, magnitude: number): number {
+  if (direction === "up") {
+    return -Math.abs(magnitude);
+  }
+  if (direction === "down") {
+    return Math.abs(magnitude);
+  }
+
+  throw new Error(`Unsupported Gemini scroll direction \`${String(direction)}\``);
+}
+
+function parseGeminiKeyCombination(keys: unknown): string[] {
+  if (typeof keys !== "string" || !keys.trim()) {
+    throw new Error("Gemini key_combination action is missing keys");
+  }
+
+  return keys
+    .split("+")
+    .map((key) => key.trim())
+    .filter(Boolean);
+}
+
+function getPngDimensions(bytes: Uint8Array): { width: number; height: number } {
+  const buffer = Buffer.from(bytes);
+  if (buffer.length < 24 || buffer.toString("ascii", 1, 4) !== "PNG") {
+    return { width: 1000, height: 1000 };
+  }
+
+  return {
+    width: buffer.readUInt32BE(16),
+    height: buffer.readUInt32BE(20),
+  };
 }
 
 function isAbortLikeError(error: unknown, runtime: ActiveRuntime): boolean {

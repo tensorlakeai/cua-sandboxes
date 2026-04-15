@@ -2,11 +2,14 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
+import type { GenerateContentParameters } from "@google/genai";
 import { vi } from "vitest";
 
 import type { AppEnv } from "../env.js";
 import type {
   DesktopSessionLike,
+  GeminiClientLike,
+  GeminiGenerateContentResponseLike,
   OpenAIClientLike,
   OpenAIResponseLike,
   SandboxClientLike,
@@ -31,14 +34,19 @@ export async function cleanupWorkspace(root: string): Promise<void> {
   await fs.rm(root, { recursive: true, force: true });
 }
 
-export function createTestEnv(root: string): AppEnv {
+export function createTestEnv(
+  root: string,
+  overrides: Partial<AppEnv> = {},
+): AppEnv {
   return {
     HOST: "127.0.0.1",
     PORT: 3000,
     OPENAI_KEY: "openai_test_key",
+    GEMINI_KEY: undefined,
     TENSORLAKE_API_KEY: "tensorlake_test_key",
     TENSORLAKE_ORG_ID: "org_test",
     APP_DB_PATH: path.join(root, "app.sqlite"),
+    ...overrides,
   };
 }
 
@@ -133,6 +141,32 @@ export class FakeOpenAI implements OpenAIClientLike {
   }
 }
 
+type GeminiHandler = (
+  body: GenerateContentParameters,
+) => Promise<GeminiGenerateContentResponseLike>;
+
+export class FakeGemini implements GeminiClientLike {
+  private readonly queue: GeminiHandler[] = [];
+
+  readonly models = {
+    generateContent: vi.fn(async (body: GenerateContentParameters) => {
+      const handler = this.queue.shift();
+      if (!handler) {
+        throw new Error("Unexpected Gemini call");
+      }
+      return handler(body);
+    }),
+  };
+
+  enqueueResponse(response: GeminiGenerateContentResponseLike): void {
+    this.queue.push(async () => response);
+  }
+
+  enqueueHandler(handler: GeminiHandler): void {
+    this.queue.push(handler);
+  }
+}
+
 export class FakeSandboxClient implements SandboxClientLike {
   private readonly createQueue: FakeSandbox[] = [];
   private readonly sandboxes = new Map<string, FakeSandbox>();
@@ -202,6 +236,41 @@ export function computerCallResponse(
         type: "computer_call",
         call_id: callId,
         actions,
+      },
+    ],
+  };
+}
+
+export function geminiTextResponse(
+  text: string,
+  options: {
+    functionCalls?: Array<{
+      id?: string;
+      name: string;
+      args?: Record<string, unknown>;
+    }>;
+  } = {},
+): GeminiGenerateContentResponseLike {
+  return {
+    text,
+    ...(options.functionCalls ? { functionCalls: options.functionCalls } : {}),
+    candidates: [
+      {
+        content: {
+          role: "model",
+          parts: [
+            ...(text
+              ? [
+                  {
+                    text,
+                  },
+                ]
+              : []),
+            ...((options.functionCalls ?? []).map((functionCall) => ({
+              functionCall,
+            }))),
+          ],
+        },
       },
     ],
   };

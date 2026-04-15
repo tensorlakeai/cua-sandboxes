@@ -14,7 +14,8 @@ const workspaceRoot = fileURLToPath(new URL("../../../", import.meta.url));
 const envSchema = z.object({
   HOST: z.string().default("127.0.0.1"),
   PORT: z.coerce.number().int().positive().default(3000),
-  OPENAI_KEY: z.string().min(1),
+  OPENAI_KEY: z.string().min(1).optional(),
+  GEMINI_KEY: z.string().min(1).optional(),
   TENSORLAKE_API_KEY: z.string().min(1),
   TENSORLAKE_ORG_ID: z.string().min(1),
   TENSORLAKE_PROJECT_ID: z.string().min(1).optional(),
@@ -29,6 +30,10 @@ export function loadEnv(overrides?: Partial<Record<keyof AppEnv, unknown>>): App
     ...process.env,
     ...overrides,
   });
+
+  if (!env.GEMINI_KEY && !env.OPENAI_KEY) {
+    throw new Error("Either GEMINI_KEY or OPENAI_KEY must be configured");
+  }
 
   return {
     ...env,

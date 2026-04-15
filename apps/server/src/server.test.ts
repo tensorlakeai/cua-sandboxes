@@ -10,6 +10,7 @@ import {
 import { createApp } from "./server.js";
 import {
   FakeDesktop,
+  FakeGemini,
   FakeOpenAI,
   FakeSandbox,
   FakeSandboxClient,
@@ -83,6 +84,41 @@ describe("server routes", () => {
     expect(screenshot.statusCode).toBe(200);
     expect(screenshot.headers["content-type"]).toContain("image/png");
     expect(screenshot.rawPayload).toEqual(Buffer.from(tinyPngBytes()));
+  });
+
+  it("prefers Gemini for new sessions when a Gemini key is configured", async () => {
+    const workspace = await createTempWorkspace("vnc-cua-server-gemini-");
+    const sandboxClient = new FakeSandboxClient();
+    const openai = new FakeOpenAI();
+    const gemini = new FakeGemini();
+    const desktop = new FakeDesktop([tinyPngBytes()]);
+    sandboxClient.queueSandbox(new FakeSandbox("sbx-api-gemini", desktop));
+
+    const { app, store } = await createApp({
+      env: createTestEnv(workspace.root, {
+        GEMINI_KEY: "gemini_test_key",
+      }),
+      openai,
+      gemini,
+      sandboxClient,
+      screenshotDir: workspace.screenshotDir,
+      restoreOnStartup: false,
+      logger: false,
+    });
+
+    cleanups.push(async () => {
+      await app.close();
+      await cleanupWorkspace(workspace.root);
+    });
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/sessions",
+    });
+    const sessionId = (created.json() as { session: { id: string } }).session.id;
+    const record = store.requireSessionRecord(sessionId);
+
+    expect(record.provider).toBe("gemini");
   });
 
   it("terminates sandboxes when a tab is closed through the API", async () => {

@@ -19,10 +19,13 @@ type SessionRow = typeof sessionsTable.$inferSelect;
 type MessageRow = typeof messagesTable.$inferSelect;
 
 export interface SessionRecord extends SessionRow {}
+export type SessionProvider = "openai" | "gemini";
 
 export interface SessionCreateInput {
   id?: string;
   title: string;
+  provider: SessionProvider;
+  providerState?: string | null;
   sandboxId: string;
   sandboxStatus: string;
   runState: SessionRunState;
@@ -33,6 +36,8 @@ export interface SessionCreateInput {
 
 export interface SessionUpdateInput {
   title?: string;
+  provider?: SessionProvider;
+  providerState?: string | null;
   sandboxId?: string | null;
   sandboxStatus?: string;
   runState?: SessionRunState;
@@ -88,6 +93,8 @@ export class SessionStore {
     this.db.insert(sessionsTable).values({
       id,
       title: input.title,
+      provider: input.provider,
+      providerState: input.providerState ?? input.openaiLastResponseId ?? null,
       sandboxId: input.sandboxId,
       sandboxStatus: input.sandboxStatus,
       runState: input.runState,

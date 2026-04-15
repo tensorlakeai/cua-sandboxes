@@ -18,6 +18,7 @@ import Fastify, {
   type FastifyBaseLogger,
   type FastifyInstance,
 } from "fastify";
+import { GoogleGenAI } from "@google/genai";
 import OpenAI from "openai";
 import { SandboxClient } from "tensorlake";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
@@ -25,8 +26,13 @@ import { WebSocketServer, WebSocket, type RawData } from "ws";
 import { createDatabase } from "./db/client.js";
 import { loadEnv, type AppEnv } from "./env.js";
 import { EventBus } from "./lib/event-bus.js";
-import { SessionManager, type OpenAIClientLike, type SandboxClientLike } from "./services/session-manager.js";
-import { SessionStore, toSessionSummary } from "./services/session-store.js";
+import {
+  SessionManager,
+  type GeminiClientLike,
+  type OpenAIClientLike,
+  type SandboxClientLike,
+} from "./services/session-manager.js";
+import { SessionStore, toSessionSummary, type SessionProvider } from "./services/session-store.js";
 
 export interface AppBundle {
   app: FastifyInstance;
@@ -37,7 +43,9 @@ export interface AppBundle {
 export interface CreateAppOptions {
   env?: AppEnv;
   openai?: OpenAIClientLike;
+  gemini?: GeminiClientLike;
   sandboxClient?: SandboxClientLike;
+  preferredProvider?: SessionProvider;
   restoreOnStartup?: boolean;
   statusCheckIntervalMs?: number;
   screenshotDir?: string;
@@ -52,9 +60,18 @@ export async function createApp(options: CreateAppOptions = {}): Promise<AppBund
 
   const openai =
     options.openai ??
-    new OpenAI({
-      apiKey: env.OPENAI_KEY,
-    });
+    (env.OPENAI_KEY
+      ? new OpenAI({
+          apiKey: env.OPENAI_KEY,
+        })
+      : undefined);
+  const gemini =
+    options.gemini ??
+    (env.GEMINI_KEY
+      ? new GoogleGenAI({
+          apiKey: env.GEMINI_KEY,
+        })
+      : undefined);
   const sandboxClient =
     options.sandboxClient ??
     SandboxClient.forCloud({
@@ -65,11 +82,16 @@ export async function createApp(options: CreateAppOptions = {}): Promise<AppBund
         : {}),
       ...(env.TENSORLAKE_API_URL ? { apiUrl: env.TENSORLAKE_API_URL } : {}),
     });
+  const defaultProvider =
+    options.preferredProvider ??
+    (gemini ? "gemini" : "openai");
 
   const sessionManager = new SessionManager({
     store,
     eventBus,
     openai,
+    gemini,
+    defaultProvider,
     sandboxClient,
     screenshotDir:
       options.screenshotDir ??

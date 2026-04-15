@@ -31,6 +31,8 @@ export function createDatabase(dbPath: string): DatabaseBundle {
     CREATE TABLE IF NOT EXISTS sessions (
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
+      provider TEXT NOT NULL DEFAULT 'openai',
+      provider_state TEXT,
       sandbox_id TEXT,
       sandbox_status TEXT NOT NULL,
       run_state TEXT NOT NULL,
@@ -56,6 +58,16 @@ export function createDatabase(dbPath: string): DatabaseBundle {
       ON messages(session_id, created_at);
   `);
 
+  ensureSessionsColumn(sqlite, "provider", "TEXT NOT NULL DEFAULT 'openai'");
+  ensureSessionsColumn(sqlite, "provider_state", "TEXT");
+  sqlite.exec(`
+    UPDATE sessions
+    SET provider_state = openai_last_response_id
+    WHERE provider = 'openai'
+      AND provider_state IS NULL
+      AND openai_last_response_id IS NOT NULL;
+  `);
+
   const db = drizzle(sqlite, {
     schema: {
       sessionsTable,
@@ -64,4 +76,20 @@ export function createDatabase(dbPath: string): DatabaseBundle {
   });
 
   return { sqlite, db, absolutePath };
+}
+
+function ensureSessionsColumn(
+  sqlite: BetterSqlite3.Database,
+  columnName: string,
+  sqlDefinition: string,
+): void {
+  const columns = sqlite
+    .prepare("PRAGMA table_info(sessions)")
+    .all() as Array<{ name: string }>;
+
+  if (columns.some((column) => column.name === columnName)) {
+    return;
+  }
+
+  sqlite.exec(`ALTER TABLE sessions ADD COLUMN ${columnName} ${sqlDefinition};`);
 }
