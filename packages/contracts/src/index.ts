@@ -11,6 +11,13 @@ export const sessionRunStateSchema = z.enum([
 
 export const messageRoleSchema = z.enum(["system", "user", "assistant"]);
 export const messageKindSchema = z.enum(["text", "status", "error"]);
+export const liveMouseButtonSchema = z.enum(["left", "middle", "right"]);
+export const liveModifierKeySchema = z.enum([
+  "Alt",
+  "Control",
+  "Meta",
+  "Shift",
+]);
 
 export const sessionSummarySchema = z.object({
   id: z.string(),
@@ -56,6 +63,46 @@ export const sessionMutationResponseSchema = z.object({
 export const deleteSessionResponseSchema = z.object({
   sessionId: z.string(),
 });
+
+export const liveDesktopPointerMoveSchema = z.object({
+  type: z.literal("pointer_move"),
+  x: z.number().int().nonnegative(),
+  y: z.number().int().nonnegative(),
+});
+
+export const liveDesktopClickSchema = z.object({
+  type: z.literal("click"),
+  x: z.number().int().nonnegative(),
+  y: z.number().int().nonnegative(),
+  button: liveMouseButtonSchema.default("left"),
+  clickCount: z.union([z.literal(1), z.literal(2)]).default(1),
+});
+
+export const liveDesktopScrollSchema = z.object({
+  type: z.literal("scroll"),
+  x: z.number().int().nonnegative(),
+  y: z.number().int().nonnegative(),
+  deltaY: z.number(),
+});
+
+export const liveDesktopTextSchema = z.object({
+  type: z.literal("text"),
+  text: z.string().min(1).max(2_000),
+});
+
+export const liveDesktopKeyPressSchema = z.object({
+  type: z.literal("key_press"),
+  key: z.string().min(1).max(64),
+  modifiers: z.array(liveModifierKeySchema).max(4).default([]),
+});
+
+export const liveDesktopInputSchema = z.discriminatedUnion("type", [
+  liveDesktopPointerMoveSchema,
+  liveDesktopClickSchema,
+  liveDesktopScrollSchema,
+  liveDesktopTextSchema,
+  liveDesktopKeyPressSchema,
+]);
 
 export const eventSessionUpsertSchema = z.object({
   type: z.literal("session.upsert"),
@@ -111,6 +158,8 @@ export type MessageRole = z.infer<typeof messageRoleSchema>;
 export type MessageKind = z.infer<typeof messageKindSchema>;
 export type SessionSummary = z.infer<typeof sessionSummarySchema>;
 export type ChatMessage = z.infer<typeof messageSchema>;
+export type LiveMouseButton = z.infer<typeof liveMouseButtonSchema>;
+export type LiveModifierKey = z.infer<typeof liveModifierKeySchema>;
 export type ListSessionsResponse = z.infer<typeof listSessionsResponseSchema>;
 export type ListMessagesResponse = z.infer<typeof listMessagesResponseSchema>;
 export type CreateSessionResponse = z.infer<typeof createSessionResponseSchema>;
@@ -119,4 +168,5 @@ export type SessionMutationResponse = z.infer<
   typeof sessionMutationResponseSchema
 >;
 export type DeleteSessionResponse = z.infer<typeof deleteSessionResponseSchema>;
+export type LiveDesktopInputEvent = z.infer<typeof liveDesktopInputSchema>;
 export type SseEvent = z.infer<typeof sseEventSchema>;

@@ -4,6 +4,7 @@
   "private": true,
   "packageManager": "pnpm@10.18.0",
   "scripts": {
+    "postinstall": "node ./scripts/patch-novnc.mjs",
     "dev": "corepack pnpm --filter @vnc-cua/contracts build && concurrently -n contracts,server,web -c yellow,cyan,magenta \"corepack pnpm --filter @vnc-cua/contracts dev\" \"corepack pnpm --filter @vnc-cua/server dev\" \"corepack pnpm --filter @vnc-cua/web dev\"",
     "build": "corepack pnpm -r build",
     "test": "corepack pnpm --filter @vnc-cua/contracts build && corepack pnpm -r test",

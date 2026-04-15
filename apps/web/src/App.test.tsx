@@ -22,6 +22,47 @@ import {
 
 import App from "./App.js";
 
+const { mockRemoteDesktopCalls } = vi.hoisted(() => ({
+  mockRemoteDesktopCalls: [] as Array<{
+    className: string | undefined;
+    interactiveEnabled: boolean;
+    session: SessionSummary | null;
+    streamEnabled: boolean;
+  }>,
+}));
+
+vi.mock("./RemoteDesktop.js", () => ({
+  RemoteDesktop: ({
+    className,
+    interactiveEnabled,
+    session,
+    streamEnabled,
+  }: {
+    className?: string;
+    interactiveEnabled: boolean;
+    session: SessionSummary | null;
+    streamEnabled: boolean;
+  }) => {
+    mockRemoteDesktopCalls.push({
+      className,
+      interactiveEnabled,
+      session,
+      streamEnabled,
+    });
+
+    const label =
+      session && session.terminatedAt === null && session.runState !== "pending" && streamEnabled
+        ? interactiveEnabled && session.runState !== "running" && session.runState !== "stopping"
+          ? "Interactive live desktop"
+          : "Live desktop"
+        : session?.lastScreenshotRevision
+          ? "Desktop screenshot"
+          : "Remote desktop placeholder";
+
+    return <div aria-label={label} className={className} />;
+  },
+}));
+
 class MockEventSource {
   static instances: MockEventSource[] = [];
 
@@ -77,6 +118,21 @@ class MockEventSource {
   static reset(): void {
     MockEventSource.instances = [];
   }
+}
+
+class MockWebSocket {
+  static readonly OPEN = 1;
+
+  onopen: ((this: WebSocket, ev: Event) => unknown) | null = null;
+  onclose: ((this: WebSocket, ev: CloseEvent) => unknown) | null = null;
+  onerror: ((this: WebSocket, ev: Event) => unknown) | null = null;
+  readonly close = vi.fn(() => {
+    this.readyState = 3;
+  });
+  readonly send = vi.fn();
+  readyState = MockWebSocket.OPEN;
+
+  constructor(public readonly url: string) {}
 }
 
 interface ApiState {
@@ -235,8 +291,10 @@ function updateSession(
 describe("App", () => {
   beforeEach(() => {
     timestampCounter = 0;
+    mockRemoteDesktopCalls.length = 0;
     MockEventSource.reset();
     vi.stubGlobal("EventSource", MockEventSource);
+    vi.stubGlobal("WebSocket", MockWebSocket);
   });
 
   afterEach(() => {
@@ -325,6 +383,43 @@ describe("App", () => {
           init?.method === "DELETE",
       ),
     ).toBe(true);
+  });
+
+  it("shows the empty state after deleting the last archived session", async () => {
+    const archived = makeSession({
+      id: "session-archived",
+      title: "Old Session",
+      sandboxId: null,
+      sandboxStatus: "terminated",
+      runState: "terminated",
+      terminatedAt: "2026-04-13T11:59:00.000Z",
+      updatedAt: "2026-04-13T12:00:00.000Z",
+    });
+
+    installFetchMock({
+      sessions: [archived],
+      messagesBySession: {
+        [archived.id]: [makeMessage({ id: "m2", sessionId: archived.id, content: "Archived summary" })],
+      },
+      createQueue: [],
+    });
+
+    render(<App />);
+
+    await screen.findByRole("button", { name: "Old Session archived" });
+    await screen.findByText("Archived summary");
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete Old Session permanently" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: "Old Session archived" })).not.toBeInTheDocument();
+    });
+
+    expect(screen.getByRole("heading", { name: "No session selected" })).toBeInTheDocument();
+    expect(screen.getByText("Start a sandbox to begin.")).toBeInTheDocument();
+    expect(screen.getByText("Create a sandbox to start chatting.")).toBeInTheDocument();
+    expect(screen.getByText("No desktop available")).toBeInTheDocument();
+    expect(screen.getByText("No archived sessions yet.")).toBeInTheDocument();
   });
 
   it("sends on Enter and keeps Shift+Enter available for multiline input", async () => {
@@ -440,10 +535,8 @@ describe("App", () => {
     });
     await screen.findByText("Live result from sandbox two");
     expect(screen.getByRole("textbox")).toBeDisabled();
-    expect(screen.getByRole("img", { name: "Sandbox 2" })).toHaveAttribute(
-      "src",
-      `/api/sessions/${sandbox2.id}/screenshot?rev=4`,
-    );
+    expect(screen.getByLabelText("Live desktop")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Pop out" })).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Old Session archived" }));
 
@@ -458,6 +551,7 @@ describe("App", () => {
       ),
     ).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Refresh" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Pop out" })).not.toBeInTheDocument();
   });
 
   it("hides the reconnect banner for archived selections and clears it after reconnect", async () => {

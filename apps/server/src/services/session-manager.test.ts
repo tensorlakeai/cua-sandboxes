@@ -194,6 +194,72 @@ describe("SessionManager", () => {
     expect(messages.at(-1)?.content).toBe("Recovered after reconnect.");
   });
 
+  it("handles live desktop input events for manual control", async () => {
+    const harness = await createHarness();
+    cleanups.push(harness.cleanup);
+
+    const desktop = new FakeDesktop([tinyPngBytes()]);
+    harness.sandboxClient.queueSandbox(new FakeSandbox("sbx-live-input", desktop));
+    const session = await harness.manager.createSession();
+    await harness.manager.waitForIdle(session.id);
+
+    await harness.manager.handleLiveDesktopInput(session.id, {
+      type: "pointer_move",
+      x: 42,
+      y: 64,
+    });
+    await harness.manager.handleLiveDesktopInput(session.id, {
+      type: "click",
+      x: 42,
+      y: 64,
+      button: "left",
+      clickCount: 1,
+    });
+    await harness.manager.handleLiveDesktopInput(session.id, {
+      type: "scroll",
+      x: 42,
+      y: 64,
+      deltaY: 180,
+    });
+    await harness.manager.handleLiveDesktopInput(session.id, {
+      type: "text",
+      text: "hello world",
+    });
+    await harness.manager.handleLiveDesktopInput(session.id, {
+      type: "key_press",
+      key: "L",
+      modifiers: ["Control"],
+    });
+
+    expect(desktop.moveMouse).toHaveBeenCalledWith(42, 64);
+    expect(desktop.click).toHaveBeenCalledWith({
+      button: "left",
+      x: 42,
+      y: 64,
+    });
+    expect(desktop.scrollDown).toHaveBeenCalledWith(2, 42, 64);
+    expect(desktop.typeText).toHaveBeenCalledWith("hello world");
+    expect(desktop.press).toHaveBeenCalledWith(["ctrl", "l"]);
+  });
+
+  it("reuses a dedicated VNC tunnel for low-latency live desktop access", async () => {
+    const harness = await createHarness();
+    cleanups.push(harness.cleanup);
+
+    const sandbox = new FakeSandbox("sbx-live-vnc", new FakeDesktop([tinyPngBytes()]));
+    harness.sandboxClient.queueSandbox(sandbox);
+    const session = await harness.manager.createSession();
+    await harness.manager.waitForIdle(session.id);
+
+    const first = await harness.manager.openLiveDesktopVnc(session.id);
+    const second = await harness.manager.openLiveDesktopVnc(session.id);
+
+    expect(first).toEqual({ host: "127.0.0.1", port: 5901 });
+    expect(second).toEqual(first);
+    expect(sandbox.createTunnel).toHaveBeenCalledTimes(1);
+    expect(sandbox.createTunnel).toHaveBeenCalledWith(5901, { localPort: 0 });
+  });
+
   it("restores running sessions and archives missing sandboxes", async () => {
     const harness = await createHarness();
     cleanups.push(harness.cleanup);

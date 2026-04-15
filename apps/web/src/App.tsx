@@ -23,6 +23,7 @@ import {
   sendMessage,
   stopSession,
 } from "./api.js";
+import { RemoteDesktop } from "./RemoteDesktop.js";
 
 type MessageMap = Record<string, ChatMessage[]>;
 
@@ -44,6 +45,7 @@ export default function App() {
   const [composer, setComposer] = useState("");
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [isCreating, setIsCreating] = useState(false);
+  const [isDesktopOverlayOpen, setIsDesktopOverlayOpen] = useState(false);
 
   useEffect(() => {
     void loadInitialState();
@@ -112,6 +114,16 @@ export default function App() {
       window.clearInterval(interval);
     };
   }, [activeSessions]);
+
+  useEffect(() => {
+    if (
+      !selectedSession ||
+      selectedSession.terminatedAt !== null ||
+      selectedSession.runState === "pending"
+    ) {
+      setIsDesktopOverlayOpen(false);
+    }
+  }, [selectedSession]);
 
   const handleEvent = useEffectEvent((event: MessageEvent<string>) => {
     const parsed = sseEventSchema.safeParse(JSON.parse(event.data));
@@ -276,12 +288,12 @@ export default function App() {
 
   async function handleDeleteArchivedSession(sessionId: string) {
     try {
+      const remainingSessions = removeSession(sessions, sessionId);
       await deleteArchivedSession(sessionId);
-      setSessions((current) => removeSession(current, sessionId));
+      setSessions(remainingSessions);
       setMessagesBySession((current) => removeMessagesForSession(current, sessionId));
       if (selectedSessionId === sessionId) {
-        const nextArchived = archivedSessions.find((session) => session.id !== sessionId);
-        setSelectedSessionId(nextArchived?.id ?? activeSessions[0]?.id ?? null);
+        setSelectedSessionId(preferredSessionId(remainingSessions));
       }
       setStatusMessage(null);
     } catch (error) {
@@ -298,14 +310,13 @@ export default function App() {
     void handleSubmitMessage();
   }
 
-  const screenshotUrl = selectedSession
-    && selectedSession.lastScreenshotRevision > 0
-    ? `/api/sessions/${selectedSession.id}/screenshot?rev=${selectedSession.lastScreenshotRevision}`
-    : null;
   const selectedMessages = selectedSession
     ? (messagesBySession[selectedSession.id] ?? [])
     : [];
   const isArchivedSelection = selectedSession?.terminatedAt !== null;
+  const canPopOutDesktop = selectedSession != null
+    && selectedSession.terminatedAt === null
+    && selectedSession.runState !== "pending";
   const composerDisabled =
     !selectedSession ||
     selectedSession.terminatedAt !== null ||
@@ -499,41 +510,36 @@ export default function App() {
           <section className="flex min-h-0 flex-col">
             <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
               <div>
-                <h2 className="text-lg font-medium text-stone-100">Current screenshot</h2>
+                <h2 className="text-lg font-medium text-stone-100">Live desktop</h2>
                 <p className="text-sm text-stone-400">
                   {selectedSession
                     ? selectedSession.runState === "pending" &&
                       selectedSession.lastScreenshotRevision === 0
-                      ? "Waiting for first screenshot"
-                      : `Revision ${selectedSession.lastScreenshotRevision}`
-                    : "No screenshot available"}
+                      ? "Waiting for first frame"
+                      : selectedSession.terminatedAt
+                        ? `Archived capture ${selectedSession.lastScreenshotRevision}`
+                        : "Streaming live from the sandbox"
+                    : "No desktop available"}
                 </p>
               </div>
+              {canPopOutDesktop ? (
+                <button
+                  className="rounded-full border border-white/10 bg-white/5 px-3 py-2 text-sm text-stone-200 transition hover:bg-white/10"
+                  onClick={() => setIsDesktopOverlayOpen(true)}
+                  type="button"
+                >
+                  Pop out
+                </button>
+              ) : null}
             </div>
 
             <div className="flex-1 overflow-hidden px-5 py-5">
-              {screenshotUrl ? (
-                <div className="h-full rounded-[28px] border border-white/10 bg-black/25 p-3">
-                  <img
-                    alt={selectedSession?.title ?? "Sandbox screenshot"}
-                    className="h-full w-full rounded-[20px] object-contain"
-                    src={screenshotUrl}
-                  />
-                </div>
-              ) : selectedSession?.runState === "pending" ? (
-                <div className="flex h-full flex-col items-center justify-center rounded-[28px] border border-dashed border-amber-300/20 bg-amber-300/6 px-6 text-center">
-                  <p className="text-base font-medium text-amber-50">
-                    Sandbox booting
-                  </p>
-                  <p className="mt-2 max-w-md text-sm text-amber-100/70">
-                    Waiting for the desktop to become available. The app will keep polling until the first screenshot is ready.
-                  </p>
-                </div>
-              ) : (
-                <div className="flex h-full items-center justify-center rounded-[28px] border border-dashed border-white/10 bg-white/3 px-6 text-center text-sm text-stone-400">
-                  Create a sandbox to see its live desktop here.
-                </div>
-              )}
+              <RemoteDesktop
+                className="h-full"
+                interactiveEnabled={!isDesktopOverlayOpen}
+                session={selectedSession}
+                streamEnabled
+              />
             </div>
 
             <div className="border-t border-white/10 px-5 py-4">
@@ -591,6 +597,37 @@ export default function App() {
           </section>
         </div>
       </div>
+      {isDesktopOverlayOpen && selectedSession ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 px-4 py-4 backdrop-blur-sm">
+          <div className="flex h-[min(800px,calc(100vh-2rem))] w-[min(1200px,calc(100vw-2rem))] flex-col border border-white/10 bg-stone-950 shadow-[0_24px_90px_rgba(0,0,0,0.55)]">
+            <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
+              <div>
+                <h2 className="text-base font-medium text-stone-100">
+                  {selectedSession.title}
+                </h2>
+                <p className="text-sm text-stone-400">
+                  Large live desktop view
+                </p>
+              </div>
+              <button
+                className="rounded-full border border-white/10 bg-white/5 px-3 py-2 text-sm text-stone-200 transition hover:bg-white/10"
+                onClick={() => setIsDesktopOverlayOpen(false)}
+                type="button"
+              >
+                Close
+              </button>
+            </div>
+            <div className="min-h-0 flex-1 p-4">
+              <RemoteDesktop
+                className="h-full"
+                interactiveEnabled
+                session={selectedSession}
+                streamEnabled
+              />
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -619,4 +656,14 @@ function sortSessions(sessions: SessionSummary[]): SessionSummary[] {
   return [...sessions].sort((left, right) =>
     right.updatedAt.localeCompare(left.updatedAt),
   );
+}
+
+function preferredSessionId(sessions: SessionSummary[]): string | null {
+  const active = sortSessions(sessions.filter((session) => session.terminatedAt === null))[0];
+  if (active) {
+    return active.id;
+  }
+
+  const archived = sortSessions(sessions.filter((session) => session.terminatedAt !== null))[0];
+  return archived?.id ?? null;
 }

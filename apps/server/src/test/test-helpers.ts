@@ -11,6 +11,7 @@ import type {
   OpenAIResponseLike,
   SandboxClientLike,
   SandboxLike,
+  SandboxTunnelLike,
 } from "../services/session-manager.js";
 
 export async function createTempWorkspace(prefix: string): Promise<{
@@ -65,14 +66,32 @@ export class FakeDesktop implements DesktopSessionLike {
   ) {}
 }
 
+export class FakeTunnel implements SandboxTunnelLike {
+  readonly close = vi.fn(async () => {});
+
+  constructor(
+    private readonly host = "127.0.0.1",
+    private readonly port = 5901,
+  ) {}
+
+  address(): { host: string; port: number } {
+    return {
+      host: this.host,
+      port: this.port,
+    };
+  }
+}
+
 export class FakeSandbox implements SandboxLike {
   readonly connectDesktop = vi.fn(async () => this.desktop);
+  readonly createTunnel = vi.fn(async () => this.tunnel);
   readonly terminate = vi.fn(async () => {});
   readonly close = vi.fn(() => {});
 
   constructor(
     public readonly sandboxId: string,
     public readonly desktop: FakeDesktop = new FakeDesktop(),
+    public readonly tunnel: FakeTunnel = new FakeTunnel(),
   ) {}
 }
 

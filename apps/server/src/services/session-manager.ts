@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import {
+  type LiveDesktopInputEvent,
   type SessionSummary,
 } from "@vnc-cua/contracts";
 
@@ -9,6 +10,8 @@ import {
   type ComputerAction,
   type DesktopLike,
   executeComputerActions,
+  normalizeKeyName,
+  scrollStepsFromDelta,
 } from "./action-executor.js";
 import {
   SessionStore,
@@ -24,9 +27,18 @@ export interface DesktopSessionLike extends DesktopLike {
   close(): Promise<void>;
 }
 
+export interface SandboxTunnelLike {
+  address(): { host: string; port: number };
+  close(): Promise<void>;
+}
+
 export interface SandboxLike {
   sandboxId: string;
   connectDesktop(options?: { password?: string }): Promise<DesktopSessionLike>;
+  createTunnel?(
+    remotePort: number,
+    options?: { localPort?: number },
+  ): Promise<SandboxTunnelLike>;
   terminate(): Promise<void>;
   close?(): void;
 }
@@ -56,6 +68,8 @@ export interface OpenAIClientLike {
 interface ActiveRuntime {
   sandbox: SandboxLike;
   desktop: DesktopSessionLike | null;
+  vncTunnel: SandboxTunnelLike | null;
+  vncTunnelPromise: Promise<SandboxTunnelLike> | null;
   bootPromise: Promise<void> | null;
   bootAbortController: AbortController | null;
   currentRunPromise: Promise<void> | null;
@@ -73,6 +87,7 @@ class RunAbortedError extends Error {
 const OPENAI_MODEL = "gpt-5.4";
 const UNTITLED_SESSION_TITLE = "New sandbox";
 const MAX_SESSION_TITLE_LENGTH = 48;
+const LIVE_STREAM_FRAME_DELAY_MS = 120;
 const SYSTEM_PROMPT = `You are a computer-use agent operating a Linux desktop inside a sandbox.
 Use the built-in computer tool for UI work. Be concise and helpful.
 Do not send, submit, post, delete, purchase, or transmit sensitive data or irreversible changes without explicit user confirmation.
@@ -115,6 +130,8 @@ export class SessionManager {
         const runtime: ActiveRuntime = {
           sandbox,
           desktop: null,
+          vncTunnel: null,
+          vncTunnelPromise: null,
           bootPromise: null,
           bootAbortController: new AbortController(),
           currentRunPromise: null,
@@ -159,6 +176,8 @@ export class SessionManager {
       const runtime: ActiveRuntime = {
         sandbox,
         desktop: null,
+        vncTunnel: null,
+        vncTunnelPromise: null,
         bootPromise: null,
         bootAbortController: new AbortController(),
         currentRunPromise: null,
@@ -264,14 +283,7 @@ export class SessionManager {
     const runtime = this.runtimes.get(sessionId);
 
     if (runtime) {
-      runtime.stopRequested = true;
-      runtime.bootAbortController?.abort();
-      runtime.abortController?.abort();
-      await runtime.bootPromise?.catch(() => {});
-      await runtime.currentRunPromise?.catch(() => {});
-      await runtime.desktop?.close().catch(() => {});
-      await runtime.sandbox.terminate().catch(() => {});
-      runtime.sandbox.close?.();
+      await this.disposeRuntime(runtime, { terminateSandbox: true });
       this.runtimes.delete(sessionId);
     }
 
@@ -294,13 +306,7 @@ export class SessionManager {
 
     const runtime = this.runtimes.get(sessionId);
     if (runtime) {
-      runtime.stopRequested = true;
-      runtime.bootAbortController?.abort();
-      runtime.abortController?.abort();
-      await runtime.bootPromise?.catch(() => {});
-      await runtime.currentRunPromise?.catch(() => {});
-      await runtime.desktop?.close().catch(() => {});
-      runtime.sandbox.close?.();
+      await this.disposeRuntime(runtime, { terminateSandbox: false });
       this.runtimes.delete(sessionId);
     }
 
@@ -317,6 +323,128 @@ export class SessionManager {
     return { sessionId };
   }
 
+  assertLiveDesktopStreamAvailable(sessionId: string): SessionSummary {
+    const { record } = this.requireLiveRuntime(sessionId, {
+      allowRunning: true,
+    });
+    return toSessionSummary(record);
+  }
+
+  async openLiveDesktopVnc(sessionId: string): Promise<{ host: string; port: number }> {
+    const { runtime } = this.requireLiveRuntime(sessionId, {
+      allowRunning: true,
+    });
+
+    if (runtime.vncTunnel) {
+      return runtime.vncTunnel.address();
+    }
+
+    if (runtime.vncTunnelPromise) {
+      const tunnel = await runtime.vncTunnelPromise;
+      return tunnel.address();
+    }
+
+    if (!runtime.sandbox.createTunnel) {
+      throw new Error(`Session ${sessionId} does not support live VNC access`);
+    }
+
+    runtime.vncTunnelPromise = runtime.sandbox
+      .createTunnel(5901, { localPort: 0 })
+      .then((tunnel) => {
+        runtime.vncTunnel = tunnel;
+        return tunnel;
+      })
+      .finally(() => {
+        runtime.vncTunnelPromise = null;
+      });
+
+    const tunnel = await runtime.vncTunnelPromise;
+    return tunnel.address();
+  }
+
+  async streamLiveFrames(
+    sessionId: string,
+    options: {
+      onFrame: (bytes: Uint8Array) => Promise<void> | void;
+      signal?: AbortSignal;
+      frameDelayMs?: number;
+    },
+  ): Promise<void> {
+    const { runtime } = this.requireLiveRuntime(sessionId, {
+      allowRunning: true,
+    });
+
+    while (!options.signal?.aborted) {
+      const bytes = await this.captureLiveFrame(
+        sessionId,
+        runtime,
+        options.signal,
+      );
+      await options.onFrame(bytes);
+      await sleepWithAbort(
+        options.frameDelayMs ?? LIVE_STREAM_FRAME_DELAY_MS,
+        options.signal,
+      );
+    }
+  }
+
+  async handleLiveDesktopInput(
+    sessionId: string,
+    event: LiveDesktopInputEvent,
+  ): Promise<void> {
+    const { desktop } = this.requireLiveRuntime(sessionId, {
+      allowRunning: false,
+    });
+
+    switch (event.type) {
+      case "pointer_move":
+        await desktop.moveMouse(event.x, event.y);
+        return;
+      case "click":
+        if (event.clickCount === 2) {
+          await desktop.doubleClick({
+            button: event.button,
+            x: event.x,
+            y: event.y,
+          });
+          return;
+        }
+
+        await desktop.click({
+          button: event.button,
+          x: event.x,
+          y: event.y,
+        });
+        return;
+      case "scroll": {
+        await desktop.moveMouse(event.x, event.y);
+        const steps = scrollStepsFromDelta(event.deltaY);
+        if (steps === 0) {
+          return;
+        }
+
+        if (event.deltaY < 0) {
+          await desktop.scrollUp(steps, event.x, event.y);
+          return;
+        }
+
+        await desktop.scrollDown(steps, event.x, event.y);
+        return;
+      }
+      case "text":
+        await desktop.typeText(event.text);
+        return;
+      case "key_press": {
+        const keys = [
+          ...event.modifiers.map((modifier) => normalizeKeyName(modifier)),
+          normalizeKeyName(event.key),
+        ];
+        await desktop.press(keys);
+        return;
+      }
+    }
+  }
+
   async waitForIdle(sessionId: string): Promise<void> {
     const runtime = this.runtimes.get(sessionId);
     await runtime?.bootPromise;
@@ -325,13 +453,7 @@ export class SessionManager {
 
   async shutdown(): Promise<void> {
     for (const [sessionId, runtime] of this.runtimes) {
-      runtime.stopRequested = true;
-      runtime.bootAbortController?.abort();
-      runtime.abortController?.abort();
-      await runtime.bootPromise?.catch(() => {});
-      await runtime.currentRunPromise?.catch(() => {});
-      await runtime.desktop?.close().catch(() => {});
-      runtime.sandbox.close?.();
+      await this.disposeRuntime(runtime, { terminateSandbox: false });
       this.runtimes.delete(sessionId);
     }
     this.options.sandboxClient.close?.();
@@ -652,6 +774,28 @@ export class SessionManager {
     }
   }
 
+  private async captureLiveFrame(
+    sessionId: string,
+    runtime: ActiveRuntime,
+    signal?: AbortSignal,
+  ): Promise<Uint8Array> {
+    const desktop = runtime.desktop;
+    if (!desktop) {
+      throw new Error(`Session ${sessionId} is still booting`);
+    }
+
+    try {
+      return await desktop.screenshot();
+    } catch (error) {
+      if (!isRecoverableDesktopRuntimeError(error)) {
+        throw error;
+      }
+
+      const reconnected = await this.reconnectDesktop(runtime, signal);
+      return reconnected.screenshot();
+    }
+  }
+
   private markSessionMissing(sessionId: string, sandboxStatus: string): void {
     const updated = this.options.store.terminateSession(sessionId, sandboxStatus);
     this.publishRunState(sessionId, "terminated");
@@ -720,6 +864,62 @@ export class SessionManager {
     const desktop = await this.connectDesktopWithRetry(runtime.sandbox, signal);
     runtime.desktop = desktop;
     return desktop;
+  }
+
+  private async disposeRuntime(
+    runtime: ActiveRuntime,
+    options: { terminateSandbox: boolean },
+  ): Promise<void> {
+    runtime.stopRequested = true;
+    runtime.bootAbortController?.abort();
+    runtime.abortController?.abort();
+    await runtime.bootPromise?.catch(() => {});
+    await runtime.currentRunPromise?.catch(() => {});
+    await runtime.desktop?.close().catch(() => {});
+    await runtime.vncTunnelPromise?.catch(() => {});
+    await runtime.vncTunnel?.close().catch(() => {});
+    runtime.vncTunnel = null;
+    runtime.vncTunnelPromise = null;
+    if (options.terminateSandbox) {
+      await runtime.sandbox.terminate().catch(() => {});
+    }
+    runtime.sandbox.close?.();
+  }
+
+  private requireLiveRuntime(
+    sessionId: string,
+    options: { allowRunning: boolean },
+  ): {
+    record: SessionRecord;
+    runtime: ActiveRuntime;
+    desktop: DesktopSessionLike;
+  } {
+    const record = this.options.store.requireSessionRecord(sessionId);
+    if (record.terminatedAt) {
+      throw new Error(`Session ${sessionId} is terminated`);
+    }
+
+    if (
+      !options.allowRunning &&
+      (record.runState === "running" || record.runState === "stopping")
+    ) {
+      throw new Error(`Session ${sessionId} is currently running`);
+    }
+
+    const runtime = this.runtimes.get(sessionId);
+    if (!runtime) {
+      throw new Error(`Session ${sessionId} is not connected`);
+    }
+
+    if (!runtime.desktop || runtime.bootPromise || record.runState === "pending") {
+      throw new Error(`Session ${sessionId} is still booting`);
+    }
+
+    return {
+      record,
+      runtime,
+      desktop: runtime.desktop,
+    };
   }
 }
 
