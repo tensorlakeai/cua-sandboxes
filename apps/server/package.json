@@ -12,6 +12,7 @@
   "dependencies": {
     "@fastify/cookie": "^11.0.2",
     "@fastify/cors": "^11.2.0",
+    "@fastify/static": "^9.1.0",
     "@google/genai": "^1.50.1",
     "@types/ws": "^8.18.1",
     "@vnc-cua/contracts": "workspace:*",
@@ -21,7 +22,7 @@
     "fastify": "^5.8.4",
     "nanoid": "^5.1.7",
     "openai": "^6.34.0",
-    "tensorlake": "link:../../../tensorlake/typescript",
+    "tensorlake": "^0.4.45",
     "ws": "^8.20.0",
     "zod": "^4.3.6"
   },

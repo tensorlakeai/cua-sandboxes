@@ -3,6 +3,7 @@ import type { IncomingMessage } from "node:http";
 import * as net from "node:net";
 import path from "node:path";
 import type { Duplex } from "node:stream";
+import { fileURLToPath } from "node:url";
 
 import {
   createSessionResponseSchema,
@@ -15,6 +16,7 @@ import {
 } from "@vnc-cua/contracts";
 import fastifyCookie from "@fastify/cookie";
 import cors from "@fastify/cors";
+import fastifyStatic from "@fastify/static";
 import Fastify, {
   type FastifyBaseLogger,
   type FastifyInstance,
@@ -58,6 +60,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<AppBund
   const { sqlite, db } = createDatabase(env.APP_DB_PATH);
   const store = new SessionStore(db);
   const eventBus = new EventBus();
+  const webDistDir = fileURLToPath(new URL("../../../apps/web/dist", import.meta.url));
 
   const openai =
     options.openai ??
@@ -251,6 +254,40 @@ export async function createApp(options: CreateAppOptions = {}): Promise<AppBund
     return deleteSessionResponseSchema.parse(deleted);
   });
 
+  if (await directoryExists(webDistDir)) {
+    await app.register(fastifyStatic, {
+      root: webDistDir,
+      prefix: "/",
+    });
+
+    app.get("/", async (_request, reply) => {
+      return reply.sendFile("index.html");
+    });
+
+    app.setNotFoundHandler(async (request, reply) => {
+      const pathname = new URL(
+        request.raw.url ?? "/",
+        `http://${request.headers.host ?? "127.0.0.1"}`,
+      ).pathname;
+
+      if (pathname === "/api" || pathname.startsWith("/api/")) {
+        reply.status(404);
+        return {
+          message: `Route ${pathname} was not found`,
+        };
+      }
+
+      if (path.extname(pathname)) {
+        reply.status(404);
+        return {
+          message: `Asset ${pathname} was not found`,
+        };
+      }
+
+      return reply.sendFile("index.html");
+    });
+  }
+
   app.server.on("upgrade", (request, socket, head) => {
     const url = new URL(
       request.url ?? "/",
@@ -354,6 +391,15 @@ export async function createApp(options: CreateAppOptions = {}): Promise<AppBund
 
 const VISITOR_COOKIE_NAME = "vnc_cua_visitor";
 const VISITOR_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365 * 5;
+
+async function directoryExists(targetPath: string): Promise<boolean> {
+  try {
+    await fs.access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function ensureVisitorId(
   request: { cookies?: Record<string, string | undefined> },
