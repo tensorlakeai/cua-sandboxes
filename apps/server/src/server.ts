@@ -13,6 +13,7 @@ import {
   postMessageRequestSchema,
   sessionMutationResponseSchema,
 } from "@vnc-cua/contracts";
+import fastifyCookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import Fastify, {
   type FastifyBaseLogger,
@@ -106,28 +107,33 @@ export async function createApp(options: CreateAppOptions = {}): Promise<AppBund
   const statusCheckIntervalMs = options.statusCheckIntervalMs ?? 10_000;
   let statusCheckTimer: ReturnType<typeof setInterval> | null = null;
 
+  await app.register(fastifyCookie);
   await app.register(cors, { origin: true });
 
-  app.get("/api/events", async (_request, reply) => {
+  app.get("/api/events", async (request, reply) => {
+    const visitorId = ensureVisitorId(request, reply);
     reply.hijack();
-    eventBus.subscribe(reply);
+    eventBus.subscribe(reply, (event) => eventBelongsToVisitor(store, visitorId, event));
   });
 
-  app.get("/api/sessions", async () => {
+  app.get("/api/sessions", async (request, reply) => {
+    const visitorId = ensureVisitorId(request, reply);
     return listSessionsResponseSchema.parse({
-      sessions: store.listSessionRecords().map(toSessionSummary),
+      sessions: store.listSessionRecordsForVisitor(visitorId).map(toSessionSummary),
     });
   });
 
-  app.post("/api/sessions", async (_request, reply) => {
-    const session = await sessionManager.createSession();
+  app.post("/api/sessions", async (request, reply) => {
+    const visitorId = ensureVisitorId(request, reply);
+    const session = await sessionManager.createSession(visitorId);
     reply.status(201);
     return createSessionResponseSchema.parse({ session });
   });
 
   app.get("/api/sessions/:id/messages", async (request, reply) => {
+    const visitorId = ensureVisitorId(request, reply);
     const sessionId = (request.params as { id: string }).id;
-    if (!store.getSessionRecord(sessionId)) {
+    if (!store.getSessionRecordForVisitor(sessionId, visitorId)) {
       reply.status(404);
       return { message: `Session ${sessionId} was not found` };
     }
@@ -138,7 +144,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<AppBund
   });
 
   app.post("/api/sessions/:id/messages", async (request, reply) => {
+    const visitorId = ensureVisitorId(request, reply);
     const sessionId = (request.params as { id: string }).id;
+    requireOwnedSession(store, visitorId, sessionId);
     const body = postMessageRequestSchema.parse(request.body);
     const session = sessionManager.sendUserMessage(sessionId, body.content);
     reply.status(202);
@@ -146,8 +154,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<AppBund
   });
 
   app.get("/api/sessions/:id/screenshot", async (request, reply) => {
+    const visitorId = ensureVisitorId(request, reply);
     const sessionId = (request.params as { id: string }).id;
-    const record = store.getSessionRecord(sessionId);
+    const record = store.getSessionRecordForVisitor(sessionId, visitorId);
     if (!record?.lastScreenshotPath) {
       reply.status(404);
       return { message: `Screenshot for ${sessionId} was not found` };
@@ -159,7 +168,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<AppBund
   });
 
   app.get("/api/sessions/:id/live", async (request, reply) => {
+    const visitorId = ensureVisitorId(request, reply);
     const sessionId = (request.params as { id: string }).id;
+    requireOwnedSession(store, visitorId, sessionId);
     sessionManager.assertLiveDesktopStreamAvailable(sessionId);
 
     const abortController = new AbortController();
@@ -208,26 +219,34 @@ export async function createApp(options: CreateAppOptions = {}): Promise<AppBund
     }
   });
 
-  app.post("/api/sessions/:id/refresh", async (request) => {
+  app.post("/api/sessions/:id/refresh", async (request, reply) => {
+    const visitorId = ensureVisitorId(request, reply);
     const sessionId = (request.params as { id: string }).id;
+    requireOwnedSession(store, visitorId, sessionId);
     const session = await sessionManager.refreshScreenshot(sessionId);
     return sessionMutationResponseSchema.parse({ session });
   });
 
-  app.post("/api/sessions/:id/stop", async (request) => {
+  app.post("/api/sessions/:id/stop", async (request, reply) => {
+    const visitorId = ensureVisitorId(request, reply);
     const sessionId = (request.params as { id: string }).id;
+    requireOwnedSession(store, visitorId, sessionId);
     const session = sessionManager.stopRun(sessionId);
     return sessionMutationResponseSchema.parse({ session });
   });
 
-  app.delete("/api/sessions/:id", async (request) => {
+  app.delete("/api/sessions/:id", async (request, reply) => {
+    const visitorId = ensureVisitorId(request, reply);
     const sessionId = (request.params as { id: string }).id;
+    requireOwnedSession(store, visitorId, sessionId);
     const session = await sessionManager.closeSession(sessionId);
     return sessionMutationResponseSchema.parse({ session });
   });
 
-  app.delete("/api/sessions/:id/permanent", async (request) => {
+  app.delete("/api/sessions/:id/permanent", async (request, reply) => {
+    const visitorId = ensureVisitorId(request, reply);
     const sessionId = (request.params as { id: string }).id;
+    requireOwnedSession(store, visitorId, sessionId);
     const deleted = await sessionManager.deleteArchivedSession(sessionId);
     return deleteSessionResponseSchema.parse(deleted);
   });
@@ -240,6 +259,11 @@ export async function createApp(options: CreateAppOptions = {}): Promise<AppBund
     const vncMatch = /^\/api\/sessions\/([^/]+)\/vnc$/.exec(url.pathname);
     if (vncMatch) {
       const sessionId = decodeURIComponent(vncMatch[1] ?? "");
+      const visitorId = getVisitorIdFromUpgradeRequest(request);
+      if (!visitorId || !store.getSessionRecordForVisitor(sessionId, visitorId)) {
+        writeUpgradeError(socket, 404, `Session ${sessionId} was not found`);
+        return;
+      }
 
       try {
         sessionManager.assertLiveDesktopStreamAvailable(sessionId);
@@ -262,6 +286,11 @@ export async function createApp(options: CreateAppOptions = {}): Promise<AppBund
     }
 
     const sessionId = decodeURIComponent(match[1] ?? "");
+    const visitorId = getVisitorIdFromUpgradeRequest(request);
+    if (!visitorId || !store.getSessionRecordForVisitor(sessionId, visitorId)) {
+      writeUpgradeError(socket, 404, `Session ${sessionId} was not found`);
+      return;
+    }
 
     try {
       sessionManager.assertLiveDesktopStreamAvailable(sessionId);
@@ -321,6 +350,79 @@ export async function createApp(options: CreateAppOptions = {}): Promise<AppBund
   }
 
   return { app, sessionManager, store };
+}
+
+const VISITOR_COOKIE_NAME = "vnc_cua_visitor";
+const VISITOR_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365 * 5;
+
+function ensureVisitorId(
+  request: { cookies?: Record<string, string | undefined> },
+  reply?: { setCookie: (name: string, value: string, options: Record<string, unknown>) => unknown },
+): string {
+  const existing = request.cookies?.[VISITOR_COOKIE_NAME];
+  if (existing) {
+    return existing;
+  }
+
+  const visitorId = crypto.randomUUID();
+  reply?.setCookie(VISITOR_COOKIE_NAME, visitorId, {
+    path: "/",
+    httpOnly: true,
+    sameSite: "lax",
+    maxAge: VISITOR_COOKIE_MAX_AGE_SECONDS,
+  });
+  return visitorId;
+}
+
+function requireOwnedSession(store: SessionStore, visitorId: string, sessionId: string) {
+  return store.requireSessionRecordForVisitor(sessionId, visitorId);
+}
+
+function getVisitorIdFromUpgradeRequest(request: IncomingMessage): string | null {
+  return parseCookieValue(request.headers.cookie, VISITOR_COOKIE_NAME);
+}
+
+function parseCookieValue(cookieHeader: string | undefined, name: string): string | null {
+  if (!cookieHeader) {
+    return null;
+  }
+
+  for (const fragment of cookieHeader.split(";")) {
+    const [rawName, ...rawValue] = fragment.trim().split("=");
+    if (rawName !== name) {
+      continue;
+    }
+
+    return decodeURIComponent(rawValue.join("="));
+  }
+
+  return null;
+}
+
+function eventBelongsToVisitor(
+  store: SessionStore,
+  visitorId: string,
+  event: Parameters<EventBus["publish"]>[0],
+): boolean {
+  const sessionId =
+    event.type === "session.upsert"
+      ? event.session.id
+      : event.type === "message.created"
+        ? event.message.sessionId
+        : event.type === "session.deleted" ||
+            event.type === "session.terminated" ||
+            event.type === "screenshot.updated" ||
+            event.type === "run.state"
+          ? event.sessionId
+          : event.type === "error" && event.sessionId
+            ? event.sessionId
+            : null;
+
+  if (!sessionId) {
+    return false;
+  }
+
+  return store.getSessionRecordForVisitor(sessionId, visitorId) !== null;
 }
 
 function statusCodeForMessage(message: string): number {

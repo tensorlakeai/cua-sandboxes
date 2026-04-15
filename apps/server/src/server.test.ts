@@ -6,6 +6,7 @@ import {
   expect,
   it,
 } from "vitest";
+import type { LightMyRequestResponse } from "fastify";
 
 import { createApp } from "./server.js";
 import {
@@ -31,6 +32,24 @@ describe("server routes", () => {
       }
     }
   });
+
+  function extractVisitorCookie(response: LightMyRequestResponse): string {
+    const setCookieHeader = response.headers["set-cookie"];
+    const cookie = Array.isArray(setCookieHeader)
+      ? setCookieHeader[0]
+      : setCookieHeader;
+
+    if (typeof cookie !== "string") {
+      throw new Error("Expected visitor cookie to be set");
+    }
+
+    const [cookiePair] = cookie.split(";");
+    if (!cookiePair) {
+      throw new Error("Expected visitor cookie pair");
+    }
+
+    return cookiePair;
+  }
 
   it("creates sessions through the API and serves their screenshots", async () => {
     const workspace = await createTempWorkspace("vnc-cua-server-");
@@ -65,6 +84,7 @@ describe("server routes", () => {
         lastScreenshotRevision: number;
       };
     };
+    const visitorCookie = extractVisitorCookie(created);
     expect(payload.session.runState).toBe("pending");
     expect(payload.session.lastScreenshotRevision).toBe(0);
 
@@ -75,6 +95,9 @@ describe("server routes", () => {
     const screenshot = await app.inject({
       method: "GET",
       url: `/api/sessions/${payload.session.id}/screenshot`,
+      headers: {
+        cookie: visitorCookie,
+      },
     });
 
     expect(created.statusCode).toBe(201);
@@ -115,6 +138,7 @@ describe("server routes", () => {
       method: "POST",
       url: "/api/sessions",
     });
+    expect(created.headers["set-cookie"]).toBeTruthy();
     const sessionId = (created.json() as { session: { id: string } }).session.id;
     const record = store.requireSessionRecord(sessionId);
 
@@ -146,11 +170,15 @@ describe("server routes", () => {
       method: "POST",
       url: "/api/sessions",
     });
+    const visitorCookie = extractVisitorCookie(created);
     const sessionId = (created.json() as { session: { id: string } }).session.id;
 
     const deleted = await app.inject({
       method: "DELETE",
       url: `/api/sessions/${sessionId}`,
+      headers: {
+        cookie: visitorCookie,
+      },
     });
     const record = store.requireSessionRecord(sessionId);
     const body = deleted.json() as {
@@ -192,12 +220,16 @@ describe("server routes", () => {
       method: "POST",
       url: "/api/sessions",
     });
+    const visitorCookie = extractVisitorCookie(created);
     const sessionId = (created.json() as { session: { id: string } }).session.id;
     await sessionManager.waitForIdle(sessionId);
 
     const archived = await app.inject({
       method: "DELETE",
       url: `/api/sessions/${sessionId}`,
+      headers: {
+        cookie: visitorCookie,
+      },
     });
     const archivedSession = (archived.json() as { session: { lastScreenshotRevision: number } }).session;
     expect(archivedSession.lastScreenshotRevision).toBe(1);
@@ -208,11 +240,68 @@ describe("server routes", () => {
     const deleted = await app.inject({
       method: "DELETE",
       url: `/api/sessions/${sessionId}/permanent`,
+      headers: {
+        cookie: visitorCookie,
+      },
     });
 
     expect(deleted.statusCode).toBe(200);
     expect(deleted.json()).toEqual({ sessionId });
     expect(store.getSessionRecord(sessionId)).toBeNull();
     expect(await fs.access(screenshotPath).then(() => true).catch(() => false)).toBe(false);
+  });
+
+  it("scopes session APIs to the visitor cookie", async () => {
+    const workspace = await createTempWorkspace("vnc-cua-server-visitors-");
+    const sandboxClient = new FakeSandboxClient();
+    const openai = new FakeOpenAI();
+    sandboxClient.queueSandbox(new FakeSandbox("sbx-api-visitor-a", new FakeDesktop([tinyPngBytes()])));
+
+    const { app, sessionManager } = await createApp({
+      env: createTestEnv(workspace.root),
+      openai,
+      sandboxClient,
+      screenshotDir: workspace.screenshotDir,
+      restoreOnStartup: false,
+      logger: false,
+    });
+
+    cleanups.push(async () => {
+      await app.close();
+      await cleanupWorkspace(workspace.root);
+    });
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/sessions",
+    });
+    const visitorACookie = extractVisitorCookie(created);
+    const sessionId = (created.json() as { session: { id: string } }).session.id;
+    await sessionManager.waitForIdle(sessionId);
+
+    const visitorAList = await app.inject({
+      method: "GET",
+      url: "/api/sessions",
+      headers: {
+        cookie: visitorACookie,
+      },
+    });
+    const visitorBList = await app.inject({
+      method: "GET",
+      url: "/api/sessions",
+    });
+    const visitorBCookie = extractVisitorCookie(visitorBList);
+    const visitorBMessages = await app.inject({
+      method: "GET",
+      url: `/api/sessions/${sessionId}/messages`,
+      headers: {
+        cookie: visitorBCookie,
+      },
+    });
+
+    expect((visitorAList.json() as { sessions: Array<{ id: string }> }).sessions).toHaveLength(1);
+    expect((visitorAList.json() as { sessions: Array<{ id: string }> }).sessions[0]?.id).toBe(sessionId);
+    expect((visitorBList.json() as { sessions: Array<{ id: string }> }).sessions).toEqual([]);
+    expect(visitorBMessages.statusCode).toBe(404);
   });
 });

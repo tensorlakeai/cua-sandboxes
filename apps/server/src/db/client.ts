@@ -31,6 +31,7 @@ export function createDatabase(dbPath: string): DatabaseBundle {
     CREATE TABLE IF NOT EXISTS sessions (
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
+      visitor_id TEXT NOT NULL,
       provider TEXT NOT NULL DEFAULT 'openai',
       provider_state TEXT,
       sandbox_id TEXT,
@@ -58,6 +59,7 @@ export function createDatabase(dbPath: string): DatabaseBundle {
       ON messages(session_id, created_at);
   `);
 
+  ensureSessionsColumn(sqlite, "visitor_id", "TEXT NOT NULL DEFAULT '__legacy__'");
   ensureSessionsColumn(sqlite, "provider", "TEXT NOT NULL DEFAULT 'openai'");
   ensureSessionsColumn(sqlite, "provider_state", "TEXT");
   sqlite.exec(`

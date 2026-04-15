@@ -61,6 +61,8 @@ async function createHarness(options: { provider?: SessionProvider } = {}) {
   };
 }
 
+const TEST_VISITOR_ID = "visitor_test";
+
 describe("SessionManager", () => {
   const cleanups: Array<() => Promise<void>> = [];
 
@@ -80,7 +82,7 @@ describe("SessionManager", () => {
     const sandbox = new FakeSandbox("sbx-create", new FakeDesktop([tinyPngBytes()]));
     harness.sandboxClient.queueSandbox(sandbox);
 
-    const session = await harness.manager.createSession();
+    const session = await harness.manager.createSession(TEST_VISITOR_ID);
     expect(session.runState).toBe("pending");
     expect(session.lastScreenshotRevision).toBe(0);
     expect(session.title).toBe("New sandbox");
@@ -107,7 +109,7 @@ describe("SessionManager", () => {
 
     const desktop = new FakeDesktop([tinyPngBytes(), Uint8Array.from([1, 2, 3, 4])]);
     harness.sandboxClient.queueSandbox(new FakeSandbox("sbx-loop", desktop));
-    const session = await harness.manager.createSession();
+    const session = await harness.manager.createSession(TEST_VISITOR_ID);
     await harness.manager.waitForIdle(session.id);
 
     harness.openai.enqueueResponse(assistantResponse("title-1", "Open Window"));
@@ -168,7 +170,7 @@ describe("SessionManager", () => {
 
     const desktop = new FakeDesktop([tinyPngBytes(), tinyPngBytes()]);
     harness.sandboxClient.queueSandbox(new FakeSandbox("sbx-gemini-loop", desktop));
-    const session = await harness.manager.createSession();
+    const session = await harness.manager.createSession(TEST_VISITOR_ID);
     await harness.manager.waitForIdle(session.id);
 
     harness.gemini?.enqueueResponse(geminiTextResponse("Open Firefox"));
@@ -239,7 +241,7 @@ describe("SessionManager", () => {
       .mockImplementationOnce(async () => desktop2);
     harness.sandboxClient.queueSandbox(sandbox);
 
-    const session = await harness.manager.createSession();
+    const session = await harness.manager.createSession(TEST_VISITOR_ID);
     await harness.manager.waitForIdle(session.id);
 
     harness.openai.enqueueResponse(assistantResponse("title-r1", "Move Mouse"));
@@ -273,7 +275,7 @@ describe("SessionManager", () => {
     desktop.press.mockRejectedValueOnce(new Error("unsupported desktop key `esc`"));
 
     harness.sandboxClient.queueSandbox(new FakeSandbox("sbx-turn-error", desktop));
-    const session = await harness.manager.createSession();
+    const session = await harness.manager.createSession(TEST_VISITOR_ID);
     await harness.manager.waitForIdle(session.id);
 
     harness.openai.enqueueResponse(assistantResponse("title-turn-error", "Press Escape"));
@@ -322,7 +324,7 @@ describe("SessionManager", () => {
     const sandbox = new FakeSandbox("sbx-timeout", desktop1);
     harness.sandboxClient.queueSandbox(sandbox);
 
-    const session = await harness.manager.createSession();
+    const session = await harness.manager.createSession(TEST_VISITOR_ID);
     await harness.manager.waitForIdle(session.id);
 
     harness.openai.enqueueResponse(assistantResponse("title-timeout", "Open App"));
@@ -358,7 +360,7 @@ describe("SessionManager", () => {
 
     const desktop = new FakeDesktop([tinyPngBytes()]);
     harness.sandboxClient.queueSandbox(new FakeSandbox("sbx-live-input", desktop));
-    const session = await harness.manager.createSession();
+    const session = await harness.manager.createSession(TEST_VISITOR_ID);
     await harness.manager.waitForIdle(session.id);
 
     await harness.manager.handleLiveDesktopInput(session.id, {
@@ -406,7 +408,7 @@ describe("SessionManager", () => {
 
     const sandbox = new FakeSandbox("sbx-live-vnc", new FakeDesktop([tinyPngBytes()]));
     harness.sandboxClient.queueSandbox(sandbox);
-    const session = await harness.manager.createSession();
+    const session = await harness.manager.createSession(TEST_VISITOR_ID);
     await harness.manager.waitForIdle(session.id);
 
     const first = await harness.manager.openLiveDesktopVnc(session.id);
@@ -425,6 +427,7 @@ describe("SessionManager", () => {
     harness.store.createSession({
       id: "session-running",
       title: "Running",
+      visitorId: TEST_VISITOR_ID,
       provider: "openai",
       sandboxId: "sbx-running",
       sandboxStatus: "running",
@@ -433,6 +436,7 @@ describe("SessionManager", () => {
     harness.store.createSession({
       id: "session-missing",
       title: "Missing",
+      visitorId: TEST_VISITOR_ID,
       provider: "openai",
       sandboxId: "sbx-missing",
       sandboxStatus: "running",
@@ -467,7 +471,7 @@ describe("SessionManager", () => {
 
     const sandbox = new FakeSandbox("sbx-external-termination", new FakeDesktop([tinyPngBytes()]));
     harness.sandboxClient.queueSandbox(sandbox);
-    const session = await harness.manager.createSession();
+    const session = await harness.manager.createSession(TEST_VISITOR_ID);
     await harness.manager.waitForIdle(session.id);
 
     harness.sandboxClient.setStatus("sbx-external-termination", "terminated");
@@ -487,7 +491,7 @@ describe("SessionManager", () => {
 
     const sandbox = new FakeSandbox("sbx-status-timeout", new FakeDesktop([tinyPngBytes()]));
     harness.sandboxClient.queueSandbox(sandbox);
-    const session = await harness.manager.createSession();
+    const session = await harness.manager.createSession(TEST_VISITOR_ID);
     await harness.manager.waitForIdle(session.id);
 
     harness.sandboxClient.setStatus("sbx-status-timeout", "terminated");
@@ -514,7 +518,7 @@ describe("SessionManager", () => {
     cleanups.push(harness.cleanup);
 
     harness.sandboxClient.queueSandbox(new FakeSandbox("sbx-stop", new FakeDesktop([tinyPngBytes()])));
-    const session = await harness.manager.createSession();
+    const session = await harness.manager.createSession(TEST_VISITOR_ID);
     await harness.manager.waitForIdle(session.id);
 
     harness.openai.enqueueResponse(assistantResponse("title-stop", "Slow Task"));

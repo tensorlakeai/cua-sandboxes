@@ -24,6 +24,7 @@ export type SessionProvider = "openai" | "gemini";
 export interface SessionCreateInput {
   id?: string;
   title: string;
+  visitorId: string;
   provider: SessionProvider;
   providerState?: string | null;
   sandboxId: string;
@@ -59,6 +60,15 @@ export class SessionStore {
     return this.db.select().from(sessionsTable).orderBy(desc(sessionsTable.updatedAt)).all();
   }
 
+  listSessionRecordsForVisitor(visitorId: string): SessionRecord[] {
+    return this.db
+      .select()
+      .from(sessionsTable)
+      .where(eq(sessionsTable.visitorId, visitorId))
+      .orderBy(desc(sessionsTable.updatedAt))
+      .all();
+  }
+
   listActiveSessionRecords(): SessionRecord[] {
     return this.db
       .select()
@@ -78,8 +88,24 @@ export class SessionStore {
     );
   }
 
+  getSessionRecordForVisitor(sessionId: string, visitorId: string): SessionRecord | null {
+    const session = this.getSessionRecord(sessionId);
+    if (!session || session.visitorId !== visitorId) {
+      return null;
+    }
+    return session;
+  }
+
   requireSessionRecord(sessionId: string): SessionRecord {
     const session = this.getSessionRecord(sessionId);
+    if (!session) {
+      throw new Error(`Session ${sessionId} was not found`);
+    }
+    return session;
+  }
+
+  requireSessionRecordForVisitor(sessionId: string, visitorId: string): SessionRecord {
+    const session = this.getSessionRecordForVisitor(sessionId, visitorId);
     if (!session) {
       throw new Error(`Session ${sessionId} was not found`);
     }
@@ -93,6 +119,7 @@ export class SessionStore {
     this.db.insert(sessionsTable).values({
       id,
       title: input.title,
+      visitorId: input.visitorId,
       provider: input.provider,
       providerState: input.providerState ?? input.openaiLastResponseId ?? null,
       sandboxId: input.sandboxId,

@@ -204,7 +204,7 @@ export class SessionManager {
     return this.statusSweepPromise;
   }
 
-  async createSession(): Promise<SessionSummary> {
+  async createSession(visitorId: string): Promise<SessionSummary> {
     const sandbox = await this.options.sandboxClient.createAndConnect({
       image: "tensorlake/ubuntu-vnc",
     });
@@ -214,6 +214,7 @@ export class SessionManager {
       const session = this.options.store.createSession({
         id: sessionId,
         title: UNTITLED_SESSION_TITLE,
+        visitorId,
         provider: this.options.defaultProvider,
         sandboxId: sandbox.sandboxId,
         sandboxStatus: "running",
@@ -361,11 +362,11 @@ export class SessionManager {
       await fs.rm(record.lastScreenshotPath, { force: true }).catch(() => {});
     }
 
-    this.options.store.deleteSession(sessionId);
     this.options.eventBus.publish({
       type: "session.deleted",
       sessionId,
     });
+    this.options.store.deleteSession(sessionId);
 
     return { sessionId };
   }

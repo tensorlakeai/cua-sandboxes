@@ -4,9 +4,12 @@ import { sseEventSchema, type SseEvent } from "@vnc-cua/contracts";
 import type { FastifyReply } from "fastify";
 
 export class EventBus {
-  private readonly clients = new Set<ServerResponse>();
+  private readonly clients = new Map<ServerResponse, (event: SseEvent) => boolean>();
 
-  subscribe(reply: FastifyReply): void {
+  subscribe(
+    reply: FastifyReply,
+    filter: (event: SseEvent) => boolean = () => true,
+  ): void {
     reply.raw.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache, no-transform",
@@ -14,7 +17,7 @@ export class EventBus {
       "X-Accel-Buffering": "no",
     });
     reply.raw.write(": connected\n\n");
-    this.clients.add(reply.raw);
+    this.clients.set(reply.raw, filter);
 
     const cleanup = () => {
       this.clients.delete(reply.raw);
@@ -28,13 +31,16 @@ export class EventBus {
     const safeEvent = sseEventSchema.parse(event);
     const payload = `event: ${safeEvent.type}\ndata: ${JSON.stringify(safeEvent)}\n\n`;
 
-    for (const client of this.clients) {
+    for (const [client, filter] of this.clients) {
+      if (!filter(safeEvent)) {
+        continue;
+      }
       client.write(payload);
     }
   }
 
   close(): void {
-    for (const client of this.clients) {
+    for (const client of this.clients.keys()) {
       client.end();
     }
     this.clients.clear();

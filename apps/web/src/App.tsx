@@ -47,6 +47,7 @@ export default function App() {
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [isCreating, setIsCreating] = useState(false);
   const [isDesktopOverlayOpen, setIsDesktopOverlayOpen] = useState(false);
+  const [isVisitorReady, setIsVisitorReady] = useState(false);
   const chatViewportRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -206,6 +207,10 @@ export default function App() {
   });
 
   useEffect(() => {
+    if (!isVisitorReady) {
+      return;
+    }
+
     const source = new EventSource("/api/events");
 
     for (const eventType of EVENT_TYPES) {
@@ -218,7 +223,7 @@ export default function App() {
     return () => {
       source.close();
     };
-  }, [handleEvent, handleStreamError, handleStreamOpen]);
+  }, [handleEvent, handleStreamError, handleStreamOpen, isVisitorReady]);
 
   async function loadInitialState() {
     try {
@@ -227,6 +232,8 @@ export default function App() {
       setSelectedSessionId(response.sessions[0]?.id ?? null);
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : "Failed to load sessions");
+    } finally {
+      setIsVisitorReady(true);
     }
   }
 
