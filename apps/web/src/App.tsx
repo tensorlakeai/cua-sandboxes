@@ -10,6 +10,7 @@ import {
   useEffect,
   useEffectEvent,
   useMemo,
+  useRef,
   useState,
   type KeyboardEvent,
 } from "react";
@@ -46,6 +47,7 @@ export default function App() {
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [isCreating, setIsCreating] = useState(false);
   const [isDesktopOverlayOpen, setIsDesktopOverlayOpen] = useState(false);
+  const chatViewportRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     void loadInitialState();
@@ -313,6 +315,16 @@ export default function App() {
   const selectedMessages = selectedSession
     ? (messagesBySession[selectedSession.id] ?? [])
     : [];
+  const latestSystemMessageId = useMemo(() => {
+    for (let index = selectedMessages.length - 1; index >= 0; index -= 1) {
+      const message = selectedMessages[index];
+      if (message?.role === "system") {
+        return message.id;
+      }
+    }
+
+    return null;
+  }, [selectedMessages]);
   const isArchivedSelection = selectedSession?.terminatedAt !== null;
   const canPopOutDesktop = selectedSession != null
     && selectedSession.terminatedAt === null
@@ -331,6 +343,15 @@ export default function App() {
       );
     }
   }, [isArchivedSelection]);
+
+  useEffect(() => {
+    const viewport = chatViewportRef.current;
+    if (!viewport) {
+      return;
+    }
+
+    viewport.scrollTop = viewport.scrollHeight;
+  }, [selectedSession?.id, selectedMessages.length]);
 
   return (
     <div className="h-screen overflow-hidden px-4 py-4 text-stone-100 md:px-6">
@@ -435,8 +456,12 @@ export default function App() {
               ) : null}
             </div>
 
-            <ScrollArea.Root className="min-h-0 flex-1">
-              <ScrollArea.Viewport className="h-full px-5 py-5">
+            <ScrollArea.Root className="min-h-0 flex-1 overflow-hidden">
+              <ScrollArea.Viewport
+                className="h-full overscroll-contain px-5 py-5"
+                data-testid="chat-scroll-viewport"
+                ref={chatViewportRef}
+              >
                 <div className="space-y-4">
                   {selectedMessages.length === 0 ? (
                     <div className="rounded-[24px] border border-dashed border-white/10 bg-white/3 px-4 py-6 text-sm text-stone-400">
@@ -445,30 +470,53 @@ export default function App() {
                         : "Create a sandbox to start chatting."}
                     </div>
                   ) : (
-                    selectedMessages.map((message) => (
-                      <article
-                        className={`max-w-[92%] rounded-[24px] px-4 py-3 shadow-[0_10px_30px_rgba(0,0,0,0.18)] ${
-                          message.role === "user"
-                            ? "ml-auto bg-amber-300 text-stone-950"
-                            : message.kind === "error"
-                              ? "bg-rose-500/16 text-rose-50 ring-1 ring-rose-500/20"
-                              : message.role === "system"
-                                ? "bg-white/5 text-stone-300 ring-1 ring-white/10"
-                                : "bg-teal-400/14 text-stone-100 ring-1 ring-teal-300/18"
-                        }`}
-                        key={message.id}
-                      >
-                        <div className="mb-2 text-[11px] uppercase tracking-[0.2em] opacity-70">
-                          {message.role}
-                        </div>
-                        <p className="whitespace-pre-wrap text-sm leading-6">
-                          {message.content}
-                        </p>
-                      </article>
-                    ))
+                    selectedMessages.map((message) => {
+                      const isCompactSystemMessage =
+                        message.role === "system" && message.id !== latestSystemMessageId;
+
+                      if (isCompactSystemMessage) {
+                        return (
+                          <div
+                            className="border-l border-white/10 pl-3 text-xs leading-5 text-stone-500"
+                            key={message.id}
+                          >
+                            <p className="whitespace-pre-wrap">{message.content}</p>
+                          </div>
+                        );
+                      }
+
+                      return (
+                        <article
+                          className={`max-w-[92%] rounded-[24px] px-4 py-3 shadow-[0_10px_30px_rgba(0,0,0,0.18)] ${
+                            message.role === "user"
+                              ? "ml-auto bg-amber-300 text-stone-950"
+                              : message.kind === "error"
+                                ? "bg-rose-500/16 text-rose-50 ring-1 ring-rose-500/20"
+                                : message.role === "system"
+                                  ? "bg-white/5 text-stone-300 ring-1 ring-white/10"
+                                  : "bg-teal-400/14 text-stone-100 ring-1 ring-teal-300/18"
+                          }`}
+                          key={message.id}
+                        >
+                          <div className="mb-2 text-[11px] uppercase tracking-[0.2em] opacity-70">
+                            {message.role}
+                          </div>
+                          <p className="whitespace-pre-wrap text-sm leading-6">
+                            {message.content}
+                          </p>
+                        </article>
+                      );
+                    })
                   )}
                 </div>
               </ScrollArea.Viewport>
+              <ScrollArea.Scrollbar
+                className="flex w-3 touch-none select-none border-l border-white/5 bg-white/[0.03] p-0.5"
+                orientation="vertical"
+              >
+                <ScrollArea.Thumb className="relative flex-1 rounded-full bg-white/14 transition hover:bg-white/22" />
+              </ScrollArea.Scrollbar>
+              <ScrollArea.Corner className="bg-transparent" />
             </ScrollArea.Root>
 
             <div className="border-t border-white/10 px-5 py-4">

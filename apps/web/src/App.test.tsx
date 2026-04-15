@@ -468,6 +468,70 @@ describe("App", () => {
     });
   });
 
+  it("auto-scrolls to the latest message and keeps only the newest system update as a bubble", async () => {
+    const sandbox1 = makeSession({
+      id: "session-1",
+      title: "Sandbox 1",
+      updatedAt: "2026-04-13T12:00:10.000Z",
+    });
+
+    installFetchMock({
+      sessions: [sandbox1],
+      messagesBySession: {
+        [sandbox1.id]: [
+          makeMessage({
+            id: "sys-1",
+            sessionId: sandbox1.id,
+            role: "system",
+            kind: "status",
+            content: "Older status update",
+          }),
+          makeMessage({
+            id: "sys-2",
+            sessionId: sandbox1.id,
+            role: "system",
+            kind: "status",
+            content: "Current status update",
+          }),
+        ],
+      },
+      createQueue: [],
+    });
+
+    render(<App />);
+
+    await screen.findByRole("tab", { name: "Sandbox 1" });
+    await screen.findByText("Older status update");
+    const viewport = screen.getByTestId("chat-scroll-viewport");
+    Object.defineProperty(viewport, "scrollHeight", {
+      configurable: true,
+      value: 480,
+    });
+    viewport.scrollTop = 0;
+
+    expect(screen.getAllByText("system")).toHaveLength(1);
+    expect(screen.getByText("Older status update").closest("article")).toBeNull();
+    expect(screen.getByText("Current status update").closest("article")).not.toBeNull();
+
+    const eventSource = MockEventSource.latest();
+    await act(async () => {
+      eventSource.emit({
+        type: "message.created",
+        message: makeMessage({
+          id: "assistant-1",
+          sessionId: sandbox1.id,
+          role: "assistant",
+          kind: "text",
+          content: "Newest message",
+        }),
+      });
+    });
+
+    await waitFor(() => {
+      expect(viewport.scrollTop).toBe(480);
+    });
+  });
+
   it("applies SSE updates to the right session and loads archived transcripts", async () => {
     const sandbox1 = makeSession({
       id: "session-1",
