@@ -59,11 +59,22 @@ export class FakeDesktop implements DesktopSessionLike {
   readonly scrollUp = vi.fn(async () => {});
   readonly scrollDown = vi.fn(async () => {});
   readonly close = vi.fn(async () => {});
-  readonly screenshot = vi.fn(async () => this.screenshots.shift() ?? tinyPngBytes());
+  readonly getFrameVersion = vi.fn(() => this.frameVersion);
+  readonly screenshotAfter = vi.fn(
+    async (_frameVersion: number, _timeoutSeconds?: number) => this.takeScreenshot(),
+  );
+  readonly screenshot = vi.fn(async (_timeoutSeconds?: number) => this.takeScreenshot());
+
+  private frameVersion = 0;
 
   constructor(
     private readonly screenshots: Uint8Array[] = [tinyPngBytes()],
   ) {}
+
+  private takeScreenshot(): Uint8Array {
+    this.frameVersion += 1;
+    return this.screenshots.shift() ?? tinyPngBytes();
+  }
 }
 
 export class FakeTunnel implements SandboxTunnelLike {

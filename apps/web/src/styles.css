@@ -8,8 +8,14 @@
     sans-serif;
 }
 
+html {
+  height: 100%;
+  overflow: hidden;
+}
+
 body {
-  min-height: 100vh;
+  height: 100%;
+  overflow: hidden;
   background:
     radial-gradient(circle at top left, rgba(234, 179, 8, 0.14), transparent 32%),
     radial-gradient(circle at top right, rgba(45, 212, 191, 0.16), transparent 28%),
@@ -18,7 +24,8 @@ body {
 }
 
 #root {
-  min-height: 100vh;
+  height: 100%;
+  overflow: hidden;
 }
 
 .grid-shell {

@@ -24,6 +24,11 @@ import { writeScreenshot } from "../lib/screenshot.js";
 
 export interface DesktopSessionLike extends DesktopLike {
   screenshot(timeoutSeconds?: number): Promise<Uint8Array>;
+  getFrameVersion?(): number;
+  screenshotAfter?(
+    frameVersion: number,
+    timeoutSeconds?: number,
+  ): Promise<Uint8Array>;
   close(): Promise<void>;
 }
 
@@ -88,6 +93,9 @@ const OPENAI_MODEL = "gpt-5.4";
 const UNTITLED_SESSION_TITLE = "New sandbox";
 const MAX_SESSION_TITLE_LENGTH = 48;
 const LIVE_STREAM_FRAME_DELAY_MS = 120;
+const LIVE_FRAME_SCREENSHOT_TIMEOUT_SECONDS = 2;
+const RUNTIME_SCREENSHOT_TIMEOUT_SECONDS = 5;
+const FRESH_FRAME_WAIT_TIMEOUT_SECONDS = 0.75;
 const SYSTEM_PROMPT = `You are a computer-use agent operating a Linux desktop inside a sandbox.
 Use the built-in computer tool for UI work. Be concise and helpful.
 Do not send, submit, post, delete, purchase, or transmit sensitive data or irreversible changes without explicit user confirmation.
@@ -510,6 +518,11 @@ export class SessionManager {
       while (true) {
         this.throwIfStopped(runtime);
 
+        const assistantText = extractAssistantText(response).trim();
+        if (assistantText) {
+          this.publishAssistantText(sessionId, assistantText);
+        }
+
         const computerCall = findComputerCall(response);
         if (!computerCall) {
           break;
@@ -520,6 +533,9 @@ export class SessionManager {
           throw new Error(`Session ${sessionId} lost its desktop connection`);
         }
 
+        let frameVersionBeforeActions: number | undefined = getDesktopFrameVersion(desktop);
+        this.publishStatus(sessionId, describeComputerActions(computerCall.actions));
+
         try {
           await executeComputerActions(desktop, computerCall.actions);
         } catch (error) {
@@ -527,10 +543,14 @@ export class SessionManager {
             throw error;
           }
           await this.reconnectDesktop(runtime, runtime.abortController?.signal);
+          frameVersionBeforeActions = undefined;
         }
         this.throwIfStopped(runtime);
 
-        const { bytes } = await this.captureRuntimeScreenshot(sessionId, runtime);
+        this.publishStatus(sessionId, "Capturing screenshot...");
+        const { bytes } = await this.captureRuntimeScreenshot(sessionId, runtime, {
+          preferFrameAfterVersion: frameVersionBeforeActions,
+        });
         const screenshotBase64 = Buffer.from(bytes).toString("base64");
 
         response = await this.options.openai.responses.create(
@@ -559,20 +579,6 @@ export class SessionManager {
           openaiLastResponseId: response.id,
         });
         this.publishSession(record);
-      }
-
-      const assistantText = extractAssistantText(response).trim();
-      if (assistantText) {
-        const message = this.options.store.createMessage({
-          sessionId,
-          role: "assistant",
-          kind: "text",
-          content: assistantText,
-        });
-        this.options.eventBus.publish({
-          type: "message.created",
-          message,
-        });
       }
 
       const ready = this.options.store.updateSession(sessionId, {
@@ -727,8 +733,12 @@ export class SessionManager {
   private async captureAndPersist(
     sessionId: string,
     desktop: DesktopSessionLike,
+    options: {
+      timeoutSeconds?: number | undefined;
+      preferFrameAfterVersion?: number | undefined;
+    } = {},
   ): Promise<{ bytes: Uint8Array; session: SessionSummary }> {
-    const bytes = await desktop.screenshot();
+    const bytes = await this.captureDesktopBytes(desktop, options);
     const record = this.options.store.requireSessionRecord(sessionId);
     const screenshotPath = await writeScreenshot(
       this.options.screenshotDir,
@@ -753,6 +763,9 @@ export class SessionManager {
   private async captureRuntimeScreenshot(
     sessionId: string,
     runtime: ActiveRuntime,
+    options: {
+      preferFrameAfterVersion?: number | undefined;
+    } = {},
   ): Promise<{ bytes: Uint8Array; session: SessionSummary }> {
     const desktop = runtime.desktop;
     if (!desktop) {
@@ -760,17 +773,31 @@ export class SessionManager {
     }
 
     try {
-      return await this.captureAndPersist(sessionId, desktop);
+      return await this.captureAndPersist(
+        sessionId,
+        desktop,
+        {
+          timeoutSeconds: RUNTIME_SCREENSHOT_TIMEOUT_SECONDS,
+          preferFrameAfterVersion: options.preferFrameAfterVersion,
+        },
+      );
     } catch (error) {
       if (!isRecoverableDesktopRuntimeError(error)) {
         throw error;
       }
 
+      this.publishStatus(sessionId, "Screenshot capture stalled. Reconnecting desktop...");
       const reconnected = await this.reconnectDesktop(
         runtime,
         runtime.abortController?.signal ?? runtime.bootAbortController?.signal,
       );
-      return this.captureAndPersist(sessionId, reconnected);
+      return this.captureAndPersist(
+        sessionId,
+        reconnected,
+        {
+          timeoutSeconds: RUNTIME_SCREENSHOT_TIMEOUT_SECONDS,
+        },
+      );
     }
   }
 
@@ -785,15 +812,43 @@ export class SessionManager {
     }
 
     try {
-      return await desktop.screenshot();
+      return await desktop.screenshot(LIVE_FRAME_SCREENSHOT_TIMEOUT_SECONDS);
     } catch (error) {
       if (!isRecoverableDesktopRuntimeError(error)) {
         throw error;
       }
 
       const reconnected = await this.reconnectDesktop(runtime, signal);
-      return reconnected.screenshot();
+      return reconnected.screenshot(LIVE_FRAME_SCREENSHOT_TIMEOUT_SECONDS);
     }
+  }
+
+  private async captureDesktopBytes(
+    desktop: DesktopSessionLike,
+    options: {
+      timeoutSeconds?: number | undefined;
+      preferFrameAfterVersion?: number | undefined;
+    },
+  ): Promise<Uint8Array> {
+    if (
+      options.preferFrameAfterVersion != null &&
+      isFrameAwareDesktop(desktop)
+    ) {
+      try {
+        return await desktop.screenshotAfter(
+          options.preferFrameAfterVersion,
+          FRESH_FRAME_WAIT_TIMEOUT_SECONDS,
+        );
+      } catch (error) {
+        if (!isFreshFrameTimeoutError(error)) {
+          throw error;
+        }
+      }
+    }
+
+    return desktop.screenshot(
+      options.timeoutSeconds ?? RUNTIME_SCREENSHOT_TIMEOUT_SECONDS,
+    );
   }
 
   private markSessionMissing(sessionId: string, sandboxStatus: string): void {
@@ -884,6 +939,32 @@ export class SessionManager {
       await runtime.sandbox.terminate().catch(() => {});
     }
     runtime.sandbox.close?.();
+  }
+
+  private publishAssistantText(sessionId: string, content: string): void {
+    this.publishMessage(sessionId, "assistant", "text", content);
+  }
+
+  private publishStatus(sessionId: string, content: string): void {
+    this.publishMessage(sessionId, "system", "status", content);
+  }
+
+  private publishMessage(
+    sessionId: string,
+    role: "assistant" | "system",
+    kind: "text" | "status",
+    content: string,
+  ): void {
+    const message = this.options.store.createMessage({
+      sessionId,
+      role,
+      kind,
+      content,
+    });
+    this.options.eventBus.publish({
+      type: "message.created",
+      message,
+    });
   }
 
   private requireLiveRuntime(
@@ -1035,8 +1116,88 @@ function isRecoverableDesktopRuntimeError(error: unknown): boolean {
     message.includes("desktop tunnel closed unexpectedly") ||
     message.includes("desktop tunnel is not connected") ||
     message.includes("connection closed") ||
-    message.includes("econnreset")
+    message.includes("econnreset") ||
+    message.includes("timed out waiting for initial desktop framebuffer")
   );
+}
+
+function isFreshFrameTimeoutError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    error.message
+      .toLowerCase()
+      .includes("timed out waiting for a fresher desktop framebuffer")
+  );
+}
+
+function isFrameAwareDesktop(
+  desktop: DesktopSessionLike,
+): desktop is DesktopSessionLike & {
+  getFrameVersion(): number;
+  screenshotAfter(frameVersion: number, timeoutSeconds?: number): Promise<Uint8Array>;
+} {
+  return (
+    typeof desktop.getFrameVersion === "function" &&
+    typeof desktop.screenshotAfter === "function"
+  );
+}
+
+function getDesktopFrameVersion(desktop: DesktopSessionLike): number {
+  if (!isFrameAwareDesktop(desktop)) {
+    return 0;
+  }
+
+  return desktop.getFrameVersion();
+}
+
+function describeComputerActions(actions: ComputerAction[]): string {
+  const lines = actions.map((action, index) => `${index + 1}. ${describeComputerAction(action)}`);
+  return `Agent actions:\n${lines.join("\n")}`;
+}
+
+function describeComputerAction(action: ComputerAction): string {
+  switch (action.type) {
+    case "click":
+      return `Click ${action.button ?? "left"} at (${action.x}, ${action.y})`;
+    case "double_click":
+      return `Double-click ${action.button ?? "left"} at (${action.x}, ${action.y})`;
+    case "move":
+      return `Move mouse to (${action.x}, ${action.y})`;
+    case "drag": {
+      const path = action.path.map((point) =>
+        Array.isArray(point) ? point : [point.x, point.y] as [number, number]
+      );
+      const start = path[0];
+      const end = path.at(-1);
+      if (!start || !end) {
+        return "Drag pointer";
+      }
+      return `Drag from (${start[0]}, ${start[1]}) to (${end[0]}, ${end[1]})`;
+    }
+    case "scroll": {
+      const vertical = action.scrollY ?? 0;
+      if (vertical === 0) {
+        return `Scroll at (${action.x}, ${action.y})`;
+      }
+      return `${vertical < 0 ? "Scroll up" : "Scroll down"} at (${action.x}, ${action.y})`;
+    }
+    case "type":
+      return `Type text: ${JSON.stringify(truncate(action.text, 80))}`;
+    case "keypress":
+      return `Press keys: ${action.keys.join(" + ")}`;
+    case "wait":
+      return "Wait briefly";
+    case "screenshot":
+      return "Take screenshot";
+  }
+}
+
+function truncate(value: string, maxLength: number): string {
+  if (value.length <= maxLength) {
+    return value;
+  }
+
+  return `${value.slice(0, Math.max(0, maxLength - 1))}…`;
 }
 
 function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {

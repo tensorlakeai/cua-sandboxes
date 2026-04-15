@@ -23,6 +23,8 @@ describe("action-executor", () => {
     expect(normalizeKeyName(" CTRL ")).toBe("ctrl");
     expect(normalizeKeyName("ArrowDown")).toBe("down");
     expect(normalizeKeyName("Meta")).toBe("meta");
+    expect(normalizeKeyName("PageDown")).toBe("pagedown");
+    expect(normalizeKeyName("PAGEUP")).toBe("pageup");
     expect(normalizeDragPath([{ x: 1, y: 2 }, [3, 4]])).toEqual([
       [1, 2],
       [3, 4],

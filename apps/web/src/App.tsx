@@ -333,8 +333,8 @@ export default function App() {
   }, [isArchivedSelection]);
 
   return (
-    <div className="min-h-screen px-4 py-4 text-stone-100 md:px-6">
-      <div className="mx-auto flex min-h-[calc(100vh-2rem)] max-w-[1600px] flex-col rounded-[32px] border border-white/10 bg-stone-950/75 shadow-[0_24px_90px_rgba(0,0,0,0.45)] backdrop-blur">
+    <div className="h-screen overflow-hidden px-4 py-4 text-stone-100 md:px-6">
+      <div className="mx-auto flex h-full max-w-[1600px] flex-col overflow-hidden rounded-[32px] border border-white/10 bg-stone-950/75 shadow-[0_24px_90px_rgba(0,0,0,0.45)] backdrop-blur">
         <header className="border-b border-white/10 px-5 py-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
@@ -400,7 +400,7 @@ export default function App() {
           </Tabs.Root>
         </div>
 
-        <div className="grid-shell flex-1">
+        <div className="grid-shell min-h-0 flex-1 overflow-hidden">
           <section className="flex min-h-0 flex-col border-b border-white/10 md:border-b-0 md:border-r">
             <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
               <div>

@@ -133,8 +133,11 @@ describe("SessionManager", () => {
       x: 140,
       y: 220,
     });
+    expect(desktop.screenshotAfter).toHaveBeenCalledWith(1, 0.75);
     expect(messages.map((message) => [message.role, message.kind, message.content])).toEqual([
       ["user", "text", "Open a window"],
+      ["system", "status", "Agent actions:\n1. Move mouse to (140, 220)\n2. Click left at (140, 220)"],
+      ["system", "status", "Capturing screenshot..."],
       ["assistant", "text", "Finished opening the window."],
     ]);
     expect(record.title).toBe("Open Window");
@@ -156,9 +159,8 @@ describe("SessionManager", () => {
     cleanups.push(harness.cleanup);
 
     const desktop1 = new FakeDesktop();
-    desktop1.screenshot
+    desktop1.screenshotAfter
       .mockReset()
-      .mockResolvedValueOnce(tinyPngBytes())
       .mockRejectedValueOnce(new Error("desktop tunnel closed unexpectedly"));
     const desktop2 = new FakeDesktop([Uint8Array.from([9, 8, 7, 6])]);
 
@@ -188,10 +190,54 @@ describe("SessionManager", () => {
 
     expect(sandbox.connectDesktop).toHaveBeenCalledTimes(2);
     expect(desktop2.screenshot).toHaveBeenCalledTimes(1);
+    expect(desktop2.screenshotAfter).not.toHaveBeenCalled();
     expect(record.title).toBe("Move Mouse");
     expect(record.runState).toBe("ready");
     expect(record.lastScreenshotRevision).toBe(2);
     expect(messages.at(-1)?.content).toBe("Recovered after reconnect.");
+  });
+
+  it("falls back to the cached frame when no fresher frame arrives in time", async () => {
+    const harness = await createHarness();
+    cleanups.push(harness.cleanup);
+
+    const desktop1 = new FakeDesktop();
+    desktop1.screenshotAfter.mockRejectedValueOnce(
+      new Error("timed out waiting for a fresher desktop framebuffer after 0.75s"),
+    );
+    desktop1.screenshot.mockResolvedValueOnce(tinyPngBytes());
+
+    const sandbox = new FakeSandbox("sbx-timeout", desktop1);
+    harness.sandboxClient.queueSandbox(sandbox);
+
+    const session = await harness.manager.createSession();
+    await harness.manager.waitForIdle(session.id);
+
+    harness.openai.enqueueResponse(assistantResponse("title-timeout", "Open App"));
+    harness.openai.enqueueResponse(
+      computerCallResponse("resp-timeout-1", "call-timeout-1", [
+        { type: "click", x: 20, y: 30 },
+      ]),
+    );
+    harness.openai.enqueueResponse(assistantResponse("resp-timeout-2", "Completed after retry."));
+
+    harness.manager.sendUserMessage(session.id, "Open the app");
+    await harness.manager.waitForIdle(session.id);
+
+    const messages = harness.store.listMessages(session.id);
+    const record = harness.store.requireSessionRecord(session.id);
+
+    expect(sandbox.connectDesktop).toHaveBeenCalledTimes(1);
+    expect(record.runState).toBe("ready");
+    expect(record.lastScreenshotRevision).toBe(2);
+    expect(desktop1.screenshotAfter).toHaveBeenCalledWith(0, 0.75);
+    expect(desktop1.screenshot).toHaveBeenCalledTimes(2);
+    expect(messages.map((message) => [message.kind, message.content])).toEqual([
+      ["text", "Open the app"],
+      ["status", "Agent actions:\n1. Click left at (20, 30)"],
+      ["status", "Capturing screenshot..."],
+      ["text", "Completed after retry."],
+    ]);
   });
 
   it("handles live desktop input events for manual control", async () => {
