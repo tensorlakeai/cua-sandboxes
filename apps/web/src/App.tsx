@@ -365,10 +365,18 @@ export default function App() {
       <div className="mx-auto flex h-full max-w-[1600px] flex-col overflow-hidden rounded-[32px] border border-white/10 bg-stone-950/75 shadow-[0_24px_90px_rgba(0,0,0,0.45)] backdrop-blur">
         <header className="border-b border-white/10 px-5 py-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <div>
+            <div className="flex flex-wrap items-center gap-3">
               <h1 className="text-2xl font-semibold tracking-tight text-stone-50">
-                Tensorlake CUA Sandboxes
+                Tensorlake Computer Use Sandboxes
               </h1>
+              <a
+                className="text-sm font-medium text-amber-200 transition hover:text-amber-100"
+                href="https://github.com/tensorlakeai/cua-sandboxes"
+                rel="noreferrer"
+                target="_blank"
+              >
+                (Check out the code on GitHub)
+              </a>
             </div>
             <button
               className="rounded-full bg-amber-300 px-4 py-2 text-sm font-medium text-stone-950 transition hover:bg-amber-200 disabled:cursor-not-allowed disabled:bg-amber-300/60"
