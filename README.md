@@ -1,4 +1,4 @@
-# VNC CUA
+# Computer Use Demo
 
 A simple multi-sandbox Computer Use Agent web app built with TypeScript.
 
