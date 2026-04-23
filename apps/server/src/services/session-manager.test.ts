@@ -267,6 +267,68 @@ describe("SessionManager", () => {
     expect(messages.at(-1)?.content).toBe("Recovered after reconnect.");
   });
 
+  it("retries desktop reconnects when the first reconnect attempt times out", async () => {
+    const harness = await createHarness();
+    cleanups.push(harness.cleanup);
+
+    const desktop1 = new FakeDesktop([tinyPngBytes()]);
+    desktop1.click.mockRejectedValueOnce(new Error("desktop tunnel closed unexpectedly"));
+    const desktop2 = new FakeDesktop([Uint8Array.from([9, 8, 7, 6])]);
+
+    const sandbox = new FakeSandbox("sbx-reconnect-timeout", desktop1);
+    sandbox.connectDesktop.mockReset();
+    sandbox.connectDesktop
+      .mockImplementationOnce(async () => desktop1)
+      .mockRejectedValueOnce(
+        new Error("timed out while connecting desktop session after 4.00s"),
+      )
+      .mockImplementationOnce(async () => desktop2);
+    harness.sandboxClient.queueSandbox(sandbox);
+
+    const session = await harness.manager.createSession(TEST_VISITOR_ID);
+    await harness.manager.waitForIdle(session.id);
+
+    harness.openai.enqueueResponse(assistantResponse("title-reconnect-timeout", "Open Terminal"));
+    harness.openai.enqueueResponse(
+      computerCallResponse("resp-reconnect-timeout-1", "call-reconnect-timeout-1", [
+        { type: "click", x: 567, y: 774 },
+      ]),
+    );
+    harness.openai.enqueueResponse(
+      assistantResponse("resp-reconnect-timeout-2", "Terminal opened."),
+    );
+
+    harness.manager.sendUserMessage(session.id, "Start a terminal");
+    await harness.manager.waitForIdle(session.id);
+
+    const record = harness.store.requireSessionRecord(session.id);
+    const messages = harness.store.listMessages(session.id);
+
+    expect(sandbox.connectDesktop).toHaveBeenCalledTimes(3);
+    expect(sandbox.connectDesktop).toHaveBeenNthCalledWith(1, {
+      password: "tensorlake",
+    });
+    expect(sandbox.connectDesktop).toHaveBeenNthCalledWith(2, {
+      password: "tensorlake",
+      connectTimeout: 4,
+    });
+    expect(sandbox.connectDesktop).toHaveBeenNthCalledWith(3, {
+      password: "tensorlake",
+      connectTimeout: 4,
+    });
+    expect(record.runState).toBe("ready");
+    expect(record.title).toBe("Open Terminal");
+    expect(record.lastScreenshotRevision).toBe(2);
+    expect(desktop2.screenshot).toHaveBeenCalledTimes(1);
+    expect(messages.map((message) => [message.kind, message.content])).toEqual([
+      ["text", "Start a terminal"],
+      ["status", "Agent actions:\n1. Click left at (567, 774)"],
+      ["status", "Desktop control connection dropped. Reconnecting..."],
+      ["status", "Capturing screenshot..."],
+      ["text", "Terminal opened."],
+    ]);
+  });
+
   it("returns failed turns to ready so manual desktop control still works", async () => {
     const harness = await createHarness();
     cleanups.push(harness.cleanup);

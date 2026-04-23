@@ -13,7 +13,7 @@ It provides:
 
 ![VNC CUA screenshot](./vnc-screenshot.png)
 
-Live demo: [Tensorlake Computer Use Sandboxes](https://8080-fc2m6wo23owepkf7dsomo.sandbox.tensorlake.ai/)
+Live demo: [Tensorlake Computer Use Sandboxes](https://8080-f03mblpmqsvs913d5hgx6.sandbox.tensorlake.ai/)
 
 ## What It Uses
 

@@ -46,7 +46,10 @@ export interface SandboxTunnelLike {
 
 export interface SandboxLike {
   sandboxId: string;
-  connectDesktop(options?: { password?: string }): Promise<DesktopSessionLike>;
+  connectDesktop(options?: {
+    password?: string;
+    connectTimeout?: number;
+  }): Promise<DesktopSessionLike>;
   createTunnel?(
     remotePort: number,
     options?: { localPort?: number },
@@ -153,6 +156,7 @@ const LIVE_STREAM_FRAME_DELAY_MS = 120;
 const LIVE_FRAME_SCREENSHOT_TIMEOUT_SECONDS = 2;
 const RUNTIME_SCREENSHOT_TIMEOUT_SECONDS = 5;
 const FRESH_FRAME_WAIT_TIMEOUT_SECONDS = 0.75;
+const DESKTOP_RECONNECT_TIMEOUT_SECONDS = 4;
 const SYSTEM_PROMPT = `You are a computer-use agent operating a Linux desktop inside a sandbox.
 Use the built-in computer tool for UI work. Be concise and helpful.
 Do not send, submit, post, delete, purchase, or transmit sensitive data or irreversible changes without explicit user confirmation.
@@ -176,6 +180,7 @@ export class SessionManager {
     desktopBootWaitMs?: number;
     desktopConnectAttempts?: number;
     desktopConnectRetryMs?: number;
+    desktopReconnectTimeoutSeconds?: number;
   }) {}
 
   async restoreSessions(): Promise<void> {
@@ -868,6 +873,7 @@ export class SessionManager {
       if (!isRecoverableDesktopRuntimeError(error)) {
         throw error;
       }
+      this.publishStatus(sessionId, "Desktop control connection dropped. Reconnecting...");
       await this.reconnectDesktop(runtime, runtime.abortController?.signal);
       frameVersionBeforeActions = undefined;
     }
@@ -1133,6 +1139,9 @@ export class SessionManager {
   private async connectDesktopWithRetry(
     sandbox: SandboxLike,
     signal?: AbortSignal,
+    options: {
+      connectTimeoutSeconds?: number;
+    } = {},
   ): Promise<DesktopSessionLike> {
     const attempts = this.options.desktopConnectAttempts ?? 8;
     const retryMs = this.options.desktopConnectRetryMs ?? 2_000;
@@ -1144,7 +1153,12 @@ export class SessionManager {
       }
 
       try {
-        return await sandbox.connectDesktop({ password: "tensorlake" });
+        return await sandbox.connectDesktop({
+          password: "tensorlake",
+          ...(options.connectTimeoutSeconds != null
+            ? { connectTimeout: options.connectTimeoutSeconds }
+            : {}),
+        });
       } catch (error) {
         lastError = error;
         if (attempt === attempts || !isRetryableDesktopConnectError(error)) {
@@ -1168,7 +1182,11 @@ export class SessionManager {
     signal?: AbortSignal,
   ): Promise<DesktopSessionLike> {
     await runtime.desktop?.close().catch(() => {});
-    const desktop = await this.connectDesktopWithRetry(runtime.sandbox, signal);
+    const desktop = await this.connectDesktopWithRetry(runtime.sandbox, signal, {
+      connectTimeoutSeconds:
+        this.options.desktopReconnectTimeoutSeconds ??
+        DESKTOP_RECONNECT_TIMEOUT_SECONDS,
+    });
     runtime.desktop = desktop;
     return desktop;
   }
@@ -1743,6 +1761,10 @@ function isRetryableDesktopConnectError(error: unknown): boolean {
 
   const message = error.message.toLowerCase();
   return (
+    message.includes("timed out while connecting desktop session") ||
+    message.includes("timed out while connecting tunnel websocket") ||
+    message.includes("tunnel websocket closed before opening") ||
+    message.includes("tunnel websocket handshake failed") ||
     message.includes("502") ||
     message.includes("bad gateway") ||
     message.includes("websocket handshake failed")
@@ -1794,7 +1816,11 @@ function isRecoverableDesktopRuntimeError(error: unknown): boolean {
     message.includes("desktop tunnel is not connected") ||
     message.includes("connection closed") ||
     message.includes("econnreset") ||
-    message.includes("timed out waiting for initial desktop framebuffer")
+    message.includes("timed out waiting for initial desktop framebuffer") ||
+    message.includes("timed out while connecting desktop session") ||
+    message.includes("timed out while connecting tunnel websocket") ||
+    message.includes("tunnel websocket closed before opening") ||
+    message.includes("tunnel websocket handshake failed")
   );
 }
 
